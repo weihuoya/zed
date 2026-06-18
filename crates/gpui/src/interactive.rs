@@ -20,6 +20,30 @@ pub trait MouseEvent: InputEvent {}
 /// A gesture event from the platform.
 pub trait GestureEvent: InputEvent {}
 
+/// A touch event from the platform.
+#[derive(Clone, Debug)]
+pub struct TouchEvent {
+    /// The unique identifier of this touch point.
+    pub id: i32,
+
+    /// The phase of the touch event.
+    pub phase: TouchPhase,
+
+    /// The position of the touch on the window.
+    pub position: Point<Pixels>,
+
+    /// The modifiers that were held down when the touch occurred.
+    pub modifiers: Modifiers,
+}
+
+impl Sealed for TouchEvent {}
+impl InputEvent for TouchEvent {
+    fn to_platform_input(self) -> PlatformInput {
+        PlatformInput::Touch(self)
+    }
+}
+impl MouseEvent for TouchEvent {}
+
 /// The key down event equivalent for the platform.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KeyDownEvent {
@@ -668,6 +692,8 @@ pub enum PlatformInput {
     ScrollWheel(ScrollWheelEvent),
     /// A pinch gesture was performed.
     Pinch(PinchEvent),
+    /// A touch event was performed.
+    Touch(TouchEvent),
     /// Files were dragged and dropped onto the window.
     FileDrop(FileDropEvent),
 }
@@ -685,6 +711,7 @@ impl PlatformInput {
             PlatformInput::MouseExited(event) => Some(event),
             PlatformInput::ScrollWheel(event) => Some(event),
             PlatformInput::Pinch(event) => Some(event),
+            PlatformInput::Touch(event) => Some(event),
             PlatformInput::FileDrop(event) => Some(event),
         }
     }
@@ -701,6 +728,7 @@ impl PlatformInput {
             PlatformInput::MouseExited(_) => None,
             PlatformInput::ScrollWheel(_) => None,
             PlatformInput::Pinch(_) => None,
+            PlatformInput::Touch(_) => None,
             PlatformInput::FileDrop(_) => None,
         }
     }
