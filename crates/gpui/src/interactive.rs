@@ -245,13 +245,25 @@ pub struct KeyboardClickEvent {
     pub bounds: Bounds<Pixels>,
 }
 
-/// A click event, generated when a mouse button or keyboard button is pressed and released.
+/// A touch click event, generated when a touch is pressed and released.
+#[derive(Clone, Debug)]
+pub struct TouchClickEvent {
+    /// The touch event when the finger was pressed.
+    pub down: TouchEvent,
+
+    /// The touch event when the finger was released.
+    pub up: TouchEvent,
+}
+
+/// A click event, generated when a mouse button, keyboard button, or touch is pressed and released.
 #[derive(Clone, Debug)]
 pub enum ClickEvent {
     /// A click event trigger by a mouse button being pressed and released.
     Mouse(MouseClickEvent),
     /// A click event trigger by a keyboard button being pressed and released.
     Keyboard(KeyboardClickEvent),
+    /// A click event triggered by a touch being pressed and released.
+    Touch(TouchClickEvent),
 }
 
 impl Default for ClickEvent {
@@ -273,6 +285,7 @@ impl ClickEvent {
             // tested via observing the behavior of the `ClickEvent.shiftKey` field in Chrome 138
             // under various combinations of modifiers and keyUp / keyDown events.
             ClickEvent::Mouse(event) => event.up.modifiers,
+            ClickEvent::Touch(event) => event.up.modifiers,
         }
     }
 
@@ -280,10 +293,12 @@ impl ClickEvent {
     ///
     /// `Keyboard`: The bottom left corner of the clicked hitbox
     /// `Mouse`: The position of the mouse when the button was released.
+    /// `Touch`: The position of the touch when the finger was released.
     pub fn position(&self) -> Point<Pixels> {
         match self {
             ClickEvent::Keyboard(event) => event.bounds.bottom_left(),
             ClickEvent::Mouse(event) => event.up.position,
+            ClickEvent::Touch(event) => event.up.position,
         }
     }
 
@@ -291,10 +306,12 @@ impl ClickEvent {
     ///
     /// `Keyboard`: None
     /// `Mouse`: The position of the mouse when the button was released.
+    /// `Touch`: None
     pub fn mouse_position(&self) -> Option<Point<Pixels>> {
         match self {
             ClickEvent::Keyboard(_) => None,
             ClickEvent::Mouse(event) => Some(event.up.position),
+            ClickEvent::Touch(_) => None,
         }
     }
 
@@ -305,6 +322,7 @@ impl ClickEvent {
     pub fn is_right_click(&self) -> bool {
         match self {
             ClickEvent::Keyboard(_) => false,
+            ClickEvent::Touch(_) => false,
             ClickEvent::Mouse(event) => {
                 event.down.button == MouseButton::Right && event.up.button == MouseButton::Right
             }
@@ -318,6 +336,7 @@ impl ClickEvent {
     pub fn is_middle_click(&self) -> bool {
         match self {
             ClickEvent::Keyboard(_) => false,
+            ClickEvent::Touch(_) => false,
             ClickEvent::Mouse(event) => {
                 event.down.button == MouseButton::Middle && event.up.button == MouseButton::Middle
             }
@@ -331,6 +350,7 @@ impl ClickEvent {
     pub fn standard_click(&self) -> bool {
         match self {
             ClickEvent::Keyboard(_) => true,
+            ClickEvent::Touch(_) => true,
             ClickEvent::Mouse(event) => {
                 event.down.button == MouseButton::Left && event.up.button == MouseButton::Left
             }
@@ -344,6 +364,7 @@ impl ClickEvent {
     pub fn first_focus(&self) -> bool {
         match self {
             ClickEvent::Keyboard(_) => false,
+            ClickEvent::Touch(_) => false,
             ClickEvent::Mouse(event) => event.down.first_mouse,
         }
     }
@@ -355,6 +376,7 @@ impl ClickEvent {
     pub fn click_count(&self) -> usize {
         match self {
             ClickEvent::Keyboard(_) => 1,
+            ClickEvent::Touch(_) => 1,
             ClickEvent::Mouse(event) => event.up.click_count,
         }
     }
