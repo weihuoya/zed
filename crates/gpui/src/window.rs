@@ -8,14 +8,14 @@ use crate::{
     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
     Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
     KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite,
-    MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas,
+    MouseButton, MouseDownEvent, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas,
     PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite,
     Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage,
     RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
     SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
     StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
     SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextStyle,
-    TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
+    TextStyleRefinement, ThermalState, TouchEvent, TouchPhase, TransformationMatrix, Underline, UnderlineStyle,
     WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
     WindowOptions, WindowParams, WindowTextSystem, point, prelude::*, profiler, px, rems, size,
     transparent_black,
@@ -982,6 +982,7 @@ impl Frame {
 enum InputModality {
     Mouse,
     Keyboard,
+    Touch,
 }
 
 /// Holds the state for a specific window.
@@ -1023,6 +1024,8 @@ pub struct Window {
     default_prevented: bool,
     mouse_position: Point<Pixels>,
     mouse_hit_test: HitTest,
+    active_touches: FxHashSet<i32>,
+    primary_touch_id: Option<i32>,
     modifiers: Modifiers,
     capslock: Capslock,
     scale_factor: f32,
@@ -1730,6 +1733,8 @@ impl Window {
             default_prevented: true,
             mouse_position,
             mouse_hit_test: HitTest::default(),
+            active_touches: FxHashSet::default(),
+            primary_touch_id: None,
             modifiers,
             capslock,
             scale_factor,
@@ -4529,6 +4534,7 @@ impl Window {
         self.last_input_modality = match &event {
             PlatformInput::KeyDown(_) => InputModality::Keyboard,
             PlatformInput::MouseMove(_) | PlatformInput::MouseDown(_) => InputModality::Mouse,
+            PlatformInput::Touch(_) => InputModality::Touch,
             _ => self.last_input_modality,
         };
         if self.last_input_modality != old_modality {
@@ -4580,6 +4586,10 @@ impl Window {
                 self.modifiers = pinch.modifiers;
                 PlatformInput::Pinch(pinch)
             }
+            PlatformInput::Touch(touch) => {
+                self.modifiers = touch.modifiers;
+                PlatformInput::Touch(touch)
+            }
             // Translate dragging and dropping of external files from the operating system
             // to internal drag and drop events.
             PlatformInput::FileDrop(file_drop) => match file_drop {
@@ -4625,7 +4635,9 @@ impl Window {
             PlatformInput::KeyDown(_) | PlatformInput::KeyUp(_) => event,
         };
 
-        if let Some(any_mouse_event) = event.mouse_event() {
+        if let PlatformInput::Touch(touch) = &event {
+            self.dispatch_touch_event(touch, cx);
+        } else if let Some(any_mouse_event) = event.mouse_event() {
             self.dispatch_mouse_event(any_mouse_event, cx);
         } else if let Some(any_key_event) = event.keyboard_event() {
             self.dispatch_key_event(any_key_event, cx);
@@ -4702,6 +4714,95 @@ impl Window {
         // Auto-release pointer capture on mouse up
         if event.is::<MouseUpEvent>() && self.captured_hitbox.is_some() {
             self.captured_hitbox = None;
+        }
+    }
+
+    fn dispatch_touch_event(&mut self, event: &TouchEvent, cx: &mut App) {
+        // Track active touches and which one is the "primary" touch for fallback
+        // mouse events. The first finger to go down becomes primary and keeps that
+        // status until it is lifted, so a second finger cannot overwrite it.
+        let is_primary = match event.phase {
+            TouchPhase::Started if self.primary_touch_id.is_none() => {
+                self.primary_touch_id = Some(event.id);
+                self.active_touches.insert(event.id);
+                true
+            }
+            TouchPhase::Started => {
+                self.active_touches.insert(event.id);
+                false
+            }
+            TouchPhase::Moved => self.primary_touch_id == Some(event.id),
+            TouchPhase::Ended => {
+                self.active_touches.remove(&event.id);
+                let primary = self.primary_touch_id == Some(event.id);
+                if primary {
+                    self.primary_touch_id = None;
+                }
+                primary
+            }
+        };
+
+        #[cfg(any(feature = "inspector", debug_assertions))]
+        if self.is_inspector_picking(cx) {
+            // Touch is not used for inspector picking.
+            return;
+        }
+
+        let mut mouse_listeners = mem::take(&mut self.rendered_frame.mouse_listeners);
+
+        // Capture phase.
+        for listener in &mut mouse_listeners {
+            let listener = listener.as_mut().unwrap();
+            listener(event, DispatchPhase::Capture, self, cx);
+            if !cx.propagate_event {
+                break;
+            }
+        }
+
+        // Bubble phase.
+        if cx.propagate_event {
+            for listener in mouse_listeners.iter_mut().rev() {
+                let listener = listener.as_mut().unwrap();
+                listener(event, DispatchPhase::Bubble, self, cx);
+                if !cx.propagate_event {
+                    break;
+                }
+            }
+        }
+
+        self.rendered_frame.mouse_listeners = mouse_listeners;
+
+        // If no native touch listener consumed the primary touch, fall back to
+        // a left mouse button event so existing controls work out of the box.
+        if cx.propagate_event && is_primary {
+            let fallback = match event.phase {
+                TouchPhase::Started => Some(PlatformInput::MouseDown(MouseDownEvent {
+                    button: MouseButton::Left,
+                    position: event.position,
+                    modifiers: event.modifiers,
+                    click_count: 1,
+                    first_mouse: false,
+                })),
+                TouchPhase::Moved => Some(PlatformInput::MouseMove(MouseMoveEvent {
+                    position: event.position,
+                    pressed_button: Some(MouseButton::Left),
+                    modifiers: event.modifiers,
+                })),
+                TouchPhase::Ended => Some(PlatformInput::MouseUp(MouseUpEvent {
+                    button: MouseButton::Left,
+                    position: event.position,
+                    modifiers: event.modifiers,
+                    click_count: 1,
+                })),
+            };
+            if let Some(fallback) = fallback {
+                if let Some(any_mouse_event) = fallback.mouse_event() {
+                    // Update the mouse position so that hit-testing in dispatch_mouse_event
+                    // uses the touch location, not the last real cursor position.
+                    self.mouse_position = event.position;
+                    self.dispatch_mouse_event(any_mouse_event, cx);
+                }
+            }
         }
     }
 

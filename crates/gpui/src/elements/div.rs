@@ -23,8 +23,8 @@ use crate::{
     KeyUpEvent, KeyboardButton, KeyboardClickEvent, LayoutId, ModifiersChangedEvent, MouseButton,
     MouseClickEvent, MouseDownEvent, MouseMoveEvent, MousePressureEvent, MouseUpEvent, Overflow,
     ParentElement, Pixels, Point, Render, ScrollWheelEvent, SharedString, Size, Style,
-    StyleRefinement, Styled, Task, TooltipId, Visibility, Window, WindowControlArea, point, px,
-    size,
+    StyleRefinement, Styled, Task, TooltipId, TouchClickEvent, TouchEvent, TouchPhase, Visibility,
+    Window, WindowControlArea, point, px, size,
 };
 use collections::HashMap;
 use gpui_util::ResultExt;
@@ -1997,6 +1997,9 @@ impl Interactivity {
                     if let Some(pending_mouse_down) = element_state.pending_mouse_down.as_ref() {
                         *pending_mouse_down.borrow_mut() = None;
                     }
+                    if let Some(pending_touch_down) = element_state.pending_touch_down.as_ref() {
+                        pending_touch_down.borrow_mut().clear();
+                    }
                     if let Some(clicked_state) = element_state.clicked_state.as_ref() {
                         *clicked_state.borrow_mut() = ElementClickedState::default();
                     }
@@ -2771,6 +2774,7 @@ impl Interactivity {
                 }
 
                 window.on_mouse_event({
+                    let click_listeners = click_listeners.clone();
                     let mut captured_mouse_down = None;
                     let hitbox = hitbox.clone();
                     move |event: &MouseUpEvent, phase, window, cx| match phase {
@@ -2818,6 +2822,71 @@ impl Interactivity {
                         }
                     }
                 });
+
+                // Native touch click support: synthesize ClickEvent::Touch from
+                // touch down/up on the same hitbox, and stop propagation so the
+                // fallback mouse path doesn't also fire.
+                if !click_listeners.is_empty() {
+                    let pending_touch_down = element_state
+                        .pending_touch_down
+                        .get_or_insert_with(Default::default)
+                        .clone();
+
+                    window.on_mouse_event({
+                        let pending_touch_down = pending_touch_down.clone();
+                        let hitbox = hitbox.clone();
+                        move |event: &TouchEvent, phase, window, cx| {
+                            if phase == DispatchPhase::Bubble
+                                && event.phase == TouchPhase::Started
+                                && hitbox.bounds.contains(&event.position)
+                            {
+                                pending_touch_down
+                                    .borrow_mut()
+                                    .insert(event.id, event.clone());
+                                window.refresh();
+                                cx.stop_propagation();
+                            }
+                        }
+                    });
+
+                    window.on_mouse_event({
+                        let mut captured_touch_down = None;
+                        let hitbox = hitbox.clone();
+                        let pending_touch_down = pending_touch_down.clone();
+                        move |event: &TouchEvent, phase, window, cx| {
+                            if event.phase != TouchPhase::Ended {
+                                return;
+                            }
+
+                            match phase {
+                                DispatchPhase::Capture => {
+                                    let mut pending_touch_down = pending_touch_down.borrow_mut();
+                                    if let Some(touch_down) = pending_touch_down.get(&event.id) {
+                                        if hitbox.bounds.contains(&event.position) {
+                                            captured_touch_down =
+                                                pending_touch_down.remove(&event.id);
+                                        } else {
+                                            pending_touch_down.remove(&event.id);
+                                        }
+                                        window.refresh();
+                                    }
+                                }
+                                DispatchPhase::Bubble => {
+                                    if let Some(touch_down) = captured_touch_down.take() {
+                                        let touch_click = ClickEvent::Touch(TouchClickEvent {
+                                            down: touch_down,
+                                            up: event.clone(),
+                                        });
+                                        for listener in &click_listeners {
+                                            listener(&touch_click, window, cx);
+                                        }
+                                        cx.stop_propagation();
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
             }
 
             if let Some(hover_listener) = self.hover_listener.take() {
@@ -3257,6 +3326,7 @@ pub struct InteractiveElementState {
     /// press (mirroring the browser clearing a control's pressed state on
     /// blur). `None` means no activation key is pending.
     pub(crate) pending_keyboard_down: Option<Rc<RefCell<Option<u64>>>>,
+    pub(crate) pending_touch_down: Option<Rc<RefCell<HashMap<i32, TouchEvent>>>>,
     pub(crate) scroll_offset: Option<Rc<RefCell<Point<Pixels>>>>,
     pub(crate) active_tooltip: Option<Rc<RefCell<Option<ActiveTooltip>>>>,
 }
