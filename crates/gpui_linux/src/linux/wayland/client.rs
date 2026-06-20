@@ -33,7 +33,7 @@ use wayland_client::{
     Connection, Dispatch, Proxy, QueueHandle, delegate_noop,
     protocol::{
         wl_buffer, wl_compositor, wl_keyboard, wl_pointer, wl_registry, wl_seat, wl_shm,
-        wl_shm_pool, wl_surface,
+        wl_shm_pool, wl_surface, wl_touch,
     },
 };
 use wayland_protocols::wp::pointer_gestures::zv1::client::{
@@ -96,7 +96,7 @@ use gpui::{
     ForegroundExecutor, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent,
     MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection,
     Pixels, PlatformDisplay, PlatformInput, PlatformKeyboardLayout, PlatformWindow, Point,
-    ScrollDelta, ScrollWheelEvent, SharedString, Size, TouchPhase, WindowButtonLayout,
+    ScrollDelta, ScrollWheelEvent, SharedString, Size, TouchEvent, TouchPhase, WindowButtonLayout,
     WindowParams, point, profiler, px, size,
 };
 use gpui_wgpu::{CompositorGpuHint, GpuContext};
@@ -212,6 +212,13 @@ pub struct Output {
     pub subpixel: Option<wl_output::Subpixel>,
 }
 
+/// Per-touch-point state tracked by the Wayland client.
+#[derive(Clone)]
+pub(crate) struct TouchPoint {
+    surface_id: ObjectId,
+    position: Point<Pixels>,
+}
+
 pub(crate) struct WaylandClientState {
     serial_tracker: SerialTracker,
     globals: Globals,
@@ -222,6 +229,7 @@ pub(crate) struct WaylandClientState {
     pinch_gesture: Option<zwp_pointer_gesture_pinch_v1::ZwpPointerGesturePinchV1>,
     pinch_scale: f32,
     wl_keyboard: Option<wl_keyboard::WlKeyboard>,
+    wl_touch: Option<wl_touch::WlTouch>,
     cursor_shape_device: Option<wp_cursor_shape_device_v1::WpCursorShapeDeviceV1>,
     data_device: Option<wl_data_device::WlDataDevice>,
     primary_selection: Option<zwp_primary_selection_device_v1::ZwpPrimarySelectionDeviceV1>,
@@ -254,6 +262,9 @@ pub(crate) struct WaylandClientState {
     button_pressed: Option<MouseButton>,
     mouse_focused_window: Option<WaylandWindowStatePtr>,
     keyboard_focused_window: Option<WaylandWindowStatePtr>,
+    // Touch tracking
+    active_touches: HashMap<i32, TouchPoint>,
+    primary_touch_id: Option<i32>,
     loop_handle: LoopHandle<'static, WaylandClientStatePtr>,
     cursor_style: Option<CursorStyle>,
     cursor_hidden_window: Option<WaylandWindowStatePtr>,
@@ -492,6 +503,9 @@ impl Drop for WaylandClient {
         if let Some(wl_pointer) = &state.wl_pointer {
             wl_pointer.release();
         }
+        if let Some(wl_touch) = &state.wl_touch {
+            wl_touch.release();
+        }
         if let Some(cursor_shape_device) = &state.cursor_shape_device {
             cursor_shape_device.destroy();
         }
@@ -669,6 +683,7 @@ impl WaylandClient {
             wl_seat: seat,
             wl_pointer: None,
             wl_keyboard: None,
+            wl_touch: None,
             pinch_gesture: None,
             pinch_scale: 1.0,
             cursor_shape_device: None,
@@ -721,6 +736,9 @@ impl WaylandClient {
             button_pressed: None,
             mouse_focused_window: None,
             keyboard_focused_window: None,
+            // Touch tracking
+            active_touches: HashMap::default(),
+            primary_touch_id: None,
             loop_handle: handle.clone(),
             enter_token: None,
             cursor_style: None,
@@ -1433,6 +1451,15 @@ impl Dispatch<wl_seat::WlSeat, ()> for WaylandClientStatePtr {
                 }
 
                 state.wl_pointer = Some(pointer);
+            }
+            if capabilities.contains(wl_seat::Capability::Touch) {
+                let touch = seat.get_touch(qh, ());
+
+                if let Some(wl_touch) = &state.wl_touch {
+                    wl_touch.release();
+                }
+
+                state.wl_touch = Some(touch);
             }
         }
     }
@@ -2178,6 +2205,143 @@ impl Dispatch<zwp_pointer_gesture_pinch_v1::ZwpPointerGesturePinchV1, ()>
                 });
                 drop(state);
                 window.handle_input(input);
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<wl_touch::WlTouch, ()> for WaylandClientStatePtr {
+    fn event(
+        this: &mut Self,
+        _: &wl_touch::WlTouch,
+        event: wl_touch::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let client = this.get_client();
+        let mut state = client.borrow_mut();
+
+        match event {
+            wl_touch::Event::Down {
+                serial,
+                surface,
+                id,
+                x,
+                y,
+                ..
+            } => {
+                state.serial_tracker.update(SerialKind::Touch, serial);
+                let position = point(px(x as f32), px(y as f32));
+                let surface_id = surface.id();
+
+                let is_primary = state.primary_touch_id.is_none();
+                if is_primary {
+                    state.primary_touch_id = Some(id);
+                }
+                state.active_touches.insert(
+                    id,
+                    TouchPoint {
+                        surface_id: surface_id.clone(),
+                        position,
+                    },
+                );
+
+                if let Some(window) = get_window(&mut state, &surface_id) {
+                    if is_primary {
+                        state.mouse_focused_window = Some(window.clone());
+                        state.mouse_location = Some(position);
+                    }
+
+                    let input = PlatformInput::Touch(TouchEvent {
+                        id,
+                        phase: TouchPhase::Started,
+                        position,
+                        modifiers: state.modifiers,
+                    });
+                    drop(state);
+                    window.handle_input(input);
+                }
+            }
+            wl_touch::Event::Motion { id, x, y, .. } => {
+                let position = point(px(x as f32), px(y as f32));
+                if let Some(touch) = state.active_touches.get_mut(&id) {
+                    touch.position = position;
+                }
+
+                let is_primary = state.primary_touch_id == Some(id);
+                let surface_id = state
+                    .active_touches
+                    .get(&id)
+                    .map(|touch| touch.surface_id.clone());
+                if let Some(surface_id) = surface_id {
+                    if let Some(window) = get_window(&mut state, &surface_id) {
+                        if is_primary {
+                            state.mouse_location = Some(position);
+                        }
+
+                        let input = PlatformInput::Touch(TouchEvent {
+                            id,
+                            phase: TouchPhase::Moved,
+                            position,
+                            modifiers: state.modifiers,
+                        });
+                        drop(state);
+                        window.handle_input(input);
+                    }
+                }
+            }
+            wl_touch::Event::Up { id, .. } => {
+                let touch = state.active_touches.remove(&id);
+                let position = touch
+                    .as_ref()
+                    .map(|touch| touch.position)
+                    .unwrap_or(point(px(0.0), px(0.0)));
+                let surface_id = touch.map(|touch| touch.surface_id);
+                let is_primary = state.primary_touch_id == Some(id);
+                if is_primary {
+                    state.primary_touch_id = None;
+                    if state.active_touches.is_empty() {
+                        state.mouse_focused_window = None;
+                        state.mouse_location = None;
+                    }
+                }
+
+                if let Some(surface_id) = surface_id {
+                    if let Some(window) = get_window(&mut state, &surface_id) {
+                        let input = PlatformInput::Touch(TouchEvent {
+                            id,
+                            phase: TouchPhase::Ended,
+                            position,
+                            modifiers: state.modifiers,
+                        });
+                        drop(state);
+                        window.handle_input(input);
+                    }
+                }
+            }
+            wl_touch::Event::Cancel => {
+                let touches: Vec<(i32, TouchPoint)> = state.active_touches.drain().collect();
+                let was_primary = state.primary_touch_id.take();
+                if was_primary.is_some() {
+                    state.mouse_focused_window = None;
+                    state.mouse_location = None;
+                }
+
+                for (id, touch) in touches {
+                    if let Some(window) = get_window(&mut state, &touch.surface_id) {
+                        let input = PlatformInput::Touch(TouchEvent {
+                            id,
+                            phase: TouchPhase::Ended,
+                            position: touch.position,
+                            modifiers: state.modifiers,
+                        });
+                        drop(state);
+                        window.handle_input(input);
+                        state = client.borrow_mut();
+                    }
+                }
             }
             _ => {}
         }
