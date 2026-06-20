@@ -2333,7 +2333,7 @@ impl Dispatch<wl_touch::WlTouch, ()> for WaylandClientStatePtr {
                     if let Some(window) = get_window(&mut state, &touch.surface_id) {
                         let input = PlatformInput::Touch(TouchEvent {
                             id,
-                            phase: TouchPhase::Ended,
+                            phase: TouchPhase::Cancelled,
                             position: touch.position,
                             modifiers: state.modifiers,
                         });

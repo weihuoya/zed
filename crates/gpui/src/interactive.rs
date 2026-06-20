@@ -115,8 +115,10 @@ pub enum TouchPhase {
     /// The touch event is moving.
     #[default]
     Moved,
-    /// The touch phase has ended
+    /// The touch phase has ended.
     Ended,
+    /// The touch phase was cancelled by the platform.
+    Cancelled,
 }
 
 /// A mouse down event from the platform

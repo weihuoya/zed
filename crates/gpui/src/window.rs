@@ -8,17 +8,17 @@ use crate::{
     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
     Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
     KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite,
-    MouseButton, MouseDownEvent, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas,
-    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite,
-    Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage,
-    RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
+    MouseButton, MouseDownEvent, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels,
+    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
+    PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
+    RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
     SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
     StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
     SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextStyle,
-    TextStyleRefinement, ThermalState, TouchEvent, TouchPhase, TransformationMatrix, Underline, UnderlineStyle,
-    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
-    WindowOptions, WindowParams, WindowTextSystem, point, prelude::*, profiler, px, rems, size,
-    transparent_black,
+    TextStyleRefinement, ThermalState, TouchEvent, TouchPhase, TransformationMatrix, Underline,
+    UnderlineStyle, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls,
+    WindowDecorations, WindowOptions, WindowParams, WindowTextSystem, point, prelude::*, profiler,
+    px, rems, size, transparent_black,
 };
 
 use anyhow::{Context as _, Result, anyhow};
@@ -1026,6 +1026,7 @@ pub struct Window {
     mouse_hit_test: HitTest,
     active_touches: FxHashSet<i32>,
     primary_touch_id: Option<i32>,
+    pending_touch_clicks: FxHashSet<i32>,
     modifiers: Modifiers,
     capslock: Capslock,
     scale_factor: f32,
@@ -1735,6 +1736,7 @@ impl Window {
             mouse_hit_test: HitTest::default(),
             active_touches: FxHashSet::default(),
             primary_touch_id: None,
+            pending_touch_clicks: FxHashSet::default(),
             modifiers,
             capslock,
             scale_factor,
@@ -4740,6 +4742,13 @@ impl Window {
                 }
                 primary
             }
+            TouchPhase::Cancelled => {
+                self.active_touches.remove(&event.id);
+                if self.primary_touch_id == Some(event.id) {
+                    self.primary_touch_id = None;
+                }
+                false
+            }
         };
 
         #[cfg(any(feature = "inspector", debug_assertions))]
@@ -4794,6 +4803,7 @@ impl Window {
                     modifiers: event.modifiers,
                     click_count: 1,
                 })),
+                TouchPhase::Cancelled => None,
             };
             if let Some(fallback) = fallback {
                 if let Some(any_mouse_event) = fallback.mouse_event() {
@@ -4804,6 +4814,24 @@ impl Window {
                 }
             }
         }
+    }
+
+    /// Records that a touch is waiting for a potential click on the element
+    /// that registered the touch start. Used by scroll containers to cancel
+    /// pending clicks when a touch turns into a pan gesture.
+    pub(crate) fn register_pending_touch_click(&mut self, touch_id: i32) {
+        self.pending_touch_clicks.insert(touch_id);
+    }
+
+    /// Cancels a pending touch click, e.g. because the touch turned into a
+    /// scroll gesture.
+    pub(crate) fn cancel_pending_touch_click(&mut self, touch_id: i32) {
+        self.pending_touch_clicks.remove(&touch_id);
+    }
+
+    /// Returns whether the given touch id still has a pending click.
+    pub(crate) fn is_pending_touch_click(&self, touch_id: i32) -> bool {
+        self.pending_touch_clicks.contains(&touch_id)
     }
 
     fn dispatch_key_event(&mut self, event: &dyn Any, cx: &mut App) {
