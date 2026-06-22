@@ -1565,7 +1565,7 @@ impl Element for List {
         let height = bounds.size.height;
         let current_view = window.current_view();
         window.on_mouse_event(move |event: &TouchEvent, phase, window, cx| {
-            if !bounds.contains(&event.position) {
+            if !hitbox_id.should_handle_scroll(window) {
                 return;
             }
 

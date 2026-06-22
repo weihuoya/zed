@@ -2839,9 +2839,10 @@ impl Interactivity {
                     }
                 });
 
-                // Native touch click support: synthesize ClickEvent::Touch from
-                // touch down/up on the same hitbox, and stop propagation so the
-                // fallback mouse path doesn't also fire.
+                // Native touch click support: remember the touch down so a matching
+                // up can synthesize a ClickEvent::Touch. Don't stop propagation here;
+                // scroll listeners need to see the same touch move, and Window skips
+                // fallback mouse events while a pending click is registered.
                 if !click_listeners.is_empty() {
                     let pending_touch_down = element_state
                         .pending_touch_down
@@ -2851,17 +2852,16 @@ impl Interactivity {
                     window.on_mouse_event({
                         let pending_touch_down = pending_touch_down.clone();
                         let hitbox = hitbox.clone();
-                        move |event: &TouchEvent, phase, window, cx| {
+                        move |event: &TouchEvent, phase, window, _cx| {
                             if phase == DispatchPhase::Bubble
                                 && event.phase == TouchPhase::Started
-                                && hitbox.bounds.contains(&event.position)
+                                && hitbox.is_hovered(window)
                             {
                                 pending_touch_down
                                     .borrow_mut()
                                     .insert(event.id, event.clone());
                                 window.register_pending_touch_click(event.id);
                                 window.refresh();
-                                cx.stop_propagation();
                             }
                         }
                     });
@@ -2880,7 +2880,7 @@ impl Interactivity {
                                     let mut pending_touch_down = pending_touch_down.borrow_mut();
                                     if pending_touch_down.get(&event.id).is_some() {
                                         if window.is_pending_touch_click(event.id) {
-                                            if hitbox.bounds.contains(&event.position) {
+                                            if hitbox.is_hovered(window) {
                                                 captured_touch_down =
                                                     pending_touch_down.remove(&event.id);
                                             } else {
@@ -3133,7 +3133,7 @@ impl Interactivity {
             let scroll_offset = self.scroll_offset.clone().unwrap();
             let current_view = window.current_view();
             window.on_mouse_event(move |event: &TouchEvent, phase, window, cx| {
-                if !touch_hitbox.bounds.contains(&event.position) {
+                if !touch_hitbox.should_handle_scroll(window) {
                     return;
                 }
 

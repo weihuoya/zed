@@ -8,7 +8,7 @@ use crate::{
     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
     Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
     KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite,
-    MouseButton, MouseDownEvent, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels,
+    MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels,
     PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
     PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
     RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
@@ -1024,8 +1024,6 @@ pub struct Window {
     default_prevented: bool,
     mouse_position: Point<Pixels>,
     mouse_hit_test: HitTest,
-    active_touches: FxHashSet<i32>,
-    primary_touch_id: Option<i32>,
     pending_touch_clicks: FxHashSet<i32>,
     modifiers: Modifiers,
     capslock: Capslock,
@@ -1734,8 +1732,6 @@ impl Window {
             default_prevented: true,
             mouse_position,
             mouse_hit_test: HitTest::default(),
-            active_touches: FxHashSet::default(),
-            primary_touch_id: None,
             pending_touch_clicks: FxHashSet::default(),
             modifiers,
             capslock,
@@ -4720,42 +4716,17 @@ impl Window {
     }
 
     fn dispatch_touch_event(&mut self, event: &TouchEvent, cx: &mut App) {
-        // Track active touches and which one is the "primary" touch for fallback
-        // mouse events. The first finger to go down becomes primary and keeps that
-        // status until it is lifted, so a second finger cannot overwrite it.
-        let is_primary = match event.phase {
-            TouchPhase::Started if self.primary_touch_id.is_none() => {
-                self.primary_touch_id = Some(event.id);
-                self.active_touches.insert(event.id);
-                true
-            }
-            TouchPhase::Started => {
-                self.active_touches.insert(event.id);
-                false
-            }
-            TouchPhase::Moved => self.primary_touch_id == Some(event.id),
-            TouchPhase::Ended => {
-                self.active_touches.remove(&event.id);
-                let primary = self.primary_touch_id == Some(event.id);
-                if primary {
-                    self.primary_touch_id = None;
-                }
-                primary
-            }
-            TouchPhase::Cancelled => {
-                self.active_touches.remove(&event.id);
-                if self.primary_touch_id == Some(event.id) {
-                    self.primary_touch_id = None;
-                }
-                false
-            }
-        };
-
         #[cfg(any(feature = "inspector", debug_assertions))]
         if self.is_inspector_picking(cx) {
             // Touch is not used for inspector picking.
             return;
         }
+
+        // Update the mouse position and hit-test before dispatching native touch
+        // events, so that listeners can use is_hovered / should_handle_scroll and
+        // occluding overlays correctly block touches to background elements.
+        self.mouse_position = event.position;
+        self.mouse_hit_test = self.rendered_frame.hit_test(self.mouse_position);
 
         let mut mouse_listeners = mem::take(&mut self.rendered_frame.mouse_listeners);
 
@@ -4781,38 +4752,11 @@ impl Window {
 
         self.rendered_frame.mouse_listeners = mouse_listeners;
 
-        // If no native touch listener consumed the primary touch, fall back to
-        // a left mouse button event so existing controls work out of the box.
-        if cx.propagate_event && is_primary {
-            let fallback = match event.phase {
-                TouchPhase::Started => Some(PlatformInput::MouseDown(MouseDownEvent {
-                    button: MouseButton::Left,
-                    position: event.position,
-                    modifiers: event.modifiers,
-                    click_count: 1,
-                    first_mouse: false,
-                })),
-                TouchPhase::Moved => Some(PlatformInput::MouseMove(MouseMoveEvent {
-                    position: event.position,
-                    pressed_button: Some(MouseButton::Left),
-                    modifiers: event.modifiers,
-                })),
-                TouchPhase::Ended => Some(PlatformInput::MouseUp(MouseUpEvent {
-                    button: MouseButton::Left,
-                    position: event.position,
-                    modifiers: event.modifiers,
-                    click_count: 1,
-                })),
-                TouchPhase::Cancelled => None,
-            };
-            if let Some(fallback) = fallback {
-                if let Some(any_mouse_event) = fallback.mouse_event() {
-                    // Update the mouse position so that hit-testing in dispatch_mouse_event
-                    // uses the touch location, not the last real cursor position.
-                    self.mouse_position = event.position;
-                    self.dispatch_mouse_event(any_mouse_event, cx);
-                }
-            }
+        // Clean up any pending click state for this touch once the gesture is
+        // finished. Native click listeners consume it during the bubble phase,
+        // so this only removes stale entries.
+        if event.phase == TouchPhase::Ended || event.phase == TouchPhase::Cancelled {
+            self.cancel_pending_touch_click(event.id);
         }
     }
 
@@ -4825,7 +4769,7 @@ impl Window {
 
     /// Cancels a pending touch click, e.g. because the touch turned into a
     /// scroll gesture.
-    pub(crate) fn cancel_pending_touch_click(&mut self, touch_id: i32) {
+    pub fn cancel_pending_touch_click(&mut self, touch_id: i32) {
         self.pending_touch_clicks.remove(&touch_id);
     }
 
