@@ -193,6 +193,34 @@ impl Interactivity {
             }));
     }
 
+    /// Bind the given callback to touch events, during the bubble phase and only
+    /// while the touch is within this element's hitbox.
+    pub fn on_touch_event(
+        &mut self,
+        listener: impl Fn(&TouchEvent, &mut Window, &mut App) + 'static,
+    ) {
+        self.touch_event_listeners
+            .push(Box::new(move |event, phase, hitbox, window, cx| {
+                if phase == DispatchPhase::Bubble && hitbox.is_hovered(window) {
+                    (listener)(event, window, cx)
+                }
+            }));
+    }
+
+    /// Bind the given callback to touch events, during the capture phase and only
+    /// while the touch is within this element's hitbox.
+    pub fn capture_touch_event(
+        &mut self,
+        listener: impl Fn(&TouchEvent, &mut Window, &mut App) + 'static,
+    ) {
+        self.touch_event_listeners
+            .push(Box::new(move |event, phase, hitbox, window, cx| {
+                if phase == DispatchPhase::Capture && hitbox.is_hovered(window) {
+                    (listener)(event, window, cx)
+                }
+            }));
+    }
+
     /// Bind the given callback to the mouse pressure event, during the capture phase
     /// the imperative API equivalent to [`InteractiveElement::on_mouse_pressure`].
     ///
@@ -890,6 +918,26 @@ pub trait InteractiveElement: Sized {
         self
     }
 
+    /// Bind the given callback to touch events, during the bubble phase and only
+    /// while the touch is within this element's hitbox.
+    fn on_touch_event(
+        mut self,
+        listener: impl Fn(&TouchEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.interactivity().on_touch_event(listener);
+        self
+    }
+
+    /// Bind the given callback to touch events, during the capture phase and only
+    /// while the touch is within this element's hitbox.
+    fn capture_touch_event(
+        mut self,
+        listener: impl Fn(&TouchEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.interactivity().capture_touch_event(listener);
+        self
+    }
+
     /// Bind the given callback to the mouse down event, on any button, during the capture phase,
     /// when the mouse is outside of the bounds of this element.
     /// The fluent API equivalent to [`Interactivity::on_mouse_down_out`].
@@ -1542,6 +1590,9 @@ pub(crate) type ScrollWheelListener =
 pub(crate) type PinchListener =
     Box<dyn Fn(&PinchEvent, DispatchPhase, &Hitbox, &mut Window, &mut App) + 'static>;
 
+pub(crate) type TouchEventListener =
+    Box<dyn Fn(&TouchEvent, DispatchPhase, &Hitbox, &mut Window, &mut App) + 'static>;
+
 pub(crate) type ClickListener = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
 
 pub(crate) type DragListener =
@@ -1917,6 +1968,7 @@ pub struct Interactivity {
     pub(crate) mouse_up_listeners: Vec<MouseUpListener>,
     pub(crate) mouse_pressure_listeners: Vec<MousePressureListener>,
     pub(crate) mouse_move_listeners: Vec<MouseMoveListener>,
+    pub(crate) touch_event_listeners: Vec<TouchEventListener>,
     pub(crate) scroll_wheel_listeners: Vec<ScrollWheelListener>,
     pub(crate) pinch_listeners: Vec<PinchListener>,
     pub(crate) key_down_listeners: Vec<KeyDownListener>,
@@ -2165,6 +2217,7 @@ impl Interactivity {
             || !self.mouse_pressure_listeners.is_empty()
             || !self.mouse_down_listeners.is_empty()
             || !self.mouse_move_listeners.is_empty()
+            || !self.touch_event_listeners.is_empty()
             || !self.click_listeners.is_empty()
             || !self.aux_click_listeners.is_empty()
             || !self.scroll_wheel_listeners.is_empty()
@@ -2532,6 +2585,13 @@ impl Interactivity {
         for listener in self.mouse_up_listeners.drain(..) {
             let hitbox = hitbox.clone();
             window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {
+                listener(event, phase, &hitbox, window, cx);
+            })
+        }
+
+        for listener in self.touch_event_listeners.drain(..) {
+            let hitbox = hitbox.clone();
+            window.on_touch_event(move |event: &TouchEvent, phase, window, cx| {
                 listener(event, phase, &hitbox, window, cx);
             })
         }
