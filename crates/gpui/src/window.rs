@@ -4797,6 +4797,11 @@ impl Window {
         // so this only removes stale entries.
         if event.phase == TouchPhase::Ended || event.phase == TouchPhase::Cancelled {
             self.cancel_pending_touch_click(event.id);
+            // After the finger is lifted there is no pointer hovering over the
+            // window. Reset the mouse position so that hover styles don't stick
+            // to the last touch location on pure touch devices.
+            self.mouse_position = point(px(-1.0), px(-1.0));
+            self.mouse_hit_test = HitTest::default();
         }
     }
 
