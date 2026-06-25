@@ -8,17 +8,17 @@ use crate::{
     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
     Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
     KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite,
-    MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas,
-    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite,
-    Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage,
-    RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
+    MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels,
+    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
+    PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
+    RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
     SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
     StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
     SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextStyle,
-    TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
-    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
-    WindowOptions, WindowParams, WindowTextSystem, point, prelude::*, profiler, px, rems, size,
-    transparent_black,
+    TextStyleRefinement, ThermalState, TouchEvent, TouchPhase, TransformationMatrix, Underline,
+    UnderlineStyle, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls,
+    WindowDecorations, WindowOptions, WindowParams, WindowTextSystem, point, prelude::*, profiler,
+    px, rems, size, transparent_black,
 };
 
 use anyhow::{Context as _, Result, anyhow};
@@ -826,6 +826,7 @@ pub(crate) struct Frame {
     pub(crate) element_states: FxHashMap<(GlobalElementId, TypeId), ElementStateBox>,
     accessed_element_states: Vec<(GlobalElementId, TypeId)>,
     pub(crate) mouse_listeners: Vec<Option<AnyMouseListener>>,
+    pub(crate) touch_listeners: Vec<Option<AnyMouseListener>>,
     pub(crate) dispatch_tree: DispatchTree,
     pub(crate) scene: Scene,
     pub(crate) hitboxes: Vec<Hitbox>,
@@ -857,6 +858,7 @@ pub(crate) struct PrepaintStateIndex {
 pub(crate) struct PaintIndex {
     scene_index: usize,
     mouse_listeners_index: usize,
+    touch_listeners_index: usize,
     input_handlers_index: usize,
     cursor_styles_index: usize,
     accessed_element_states_index: usize,
@@ -872,6 +874,7 @@ impl Frame {
             element_states: FxHashMap::default(),
             accessed_element_states: Vec::new(),
             mouse_listeners: Vec::new(),
+            touch_listeners: Vec::new(),
             dispatch_tree,
             scene: Scene::default(),
             hitboxes: Vec::new(),
@@ -897,6 +900,7 @@ impl Frame {
         self.element_states.clear();
         self.accessed_element_states.clear();
         self.mouse_listeners.clear();
+        self.touch_listeners.clear();
         self.dispatch_tree.clear();
         self.scene.clear();
         self.input_handlers.clear();
@@ -982,6 +986,7 @@ impl Frame {
 enum InputModality {
     Mouse,
     Keyboard,
+    Touch,
 }
 
 /// Holds the state for a specific window.
@@ -1023,6 +1028,7 @@ pub struct Window {
     default_prevented: bool,
     mouse_position: Point<Pixels>,
     mouse_hit_test: HitTest,
+    pending_touch_clicks: FxHashSet<i32>,
     modifiers: Modifiers,
     capslock: Capslock,
     scale_factor: f32,
@@ -1730,6 +1736,7 @@ impl Window {
             default_prevented: true,
             mouse_position,
             mouse_hit_test: HitTest::default(),
+            pending_touch_clicks: FxHashSet::default(),
             modifiers,
             capslock,
             scale_factor,
@@ -2369,6 +2376,13 @@ impl Window {
     /// Sets the application identifier.
     pub fn set_app_id(&mut self, app_id: &str) {
         self.platform_window.set_app_id(app_id);
+    }
+
+    /// Sets the layer-shell surface margin (top, right, bottom, left).
+    /// Only has an effect on Wayland layer-shell windows.
+    #[cfg(all(target_os = "linux", feature = "wayland"))]
+    pub fn set_layer_shell_margin(&self, margin: (Pixels, Pixels, Pixels, Pixels)) {
+        self.platform_window.set_layer_shell_margin(margin);
     }
 
     /// Sets the window background appearance.
@@ -3123,6 +3137,7 @@ impl Window {
         PaintIndex {
             scene_index: self.next_frame.scene.len(),
             mouse_listeners_index: self.next_frame.mouse_listeners.len(),
+            touch_listeners_index: self.next_frame.touch_listeners.len(),
             input_handlers_index: self.next_frame.input_handlers.len(),
             cursor_styles_index: self.next_frame.cursor_styles.len(),
             accessed_element_states_index: self.next_frame.accessed_element_states.len(),
@@ -3147,6 +3162,12 @@ impl Window {
         self.next_frame.mouse_listeners.extend(
             self.rendered_frame.mouse_listeners
                 [range.start.mouse_listeners_index..range.end.mouse_listeners_index]
+                .iter_mut()
+                .map(|listener| listener.take()),
+        );
+        self.next_frame.touch_listeners.extend(
+            self.rendered_frame.touch_listeners
+                [range.start.touch_listeners_index..range.end.touch_listeners_index]
                 .iter_mut()
                 .map(|listener| listener.take()),
         );
@@ -4372,6 +4393,28 @@ impl Window {
         )));
     }
 
+    /// Register a touch event listener on this node for the next frame.
+    ///
+    /// This is separate from `on_mouse_event` so that touch input is not treated
+    /// as a mouse event. When the next frame is rendered the listener will be
+    /// cleared.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn on_touch_event(
+        &mut self,
+        mut listener: impl FnMut(&TouchEvent, DispatchPhase, &mut Window, &mut App) + 'static,
+    ) {
+        self.invalidator.debug_assert_paint();
+
+        self.next_frame.touch_listeners.push(Some(Box::new(
+            move |event: &dyn Any, phase: DispatchPhase, window: &mut Window, cx: &mut App| {
+                if let Some(event) = event.downcast_ref::<TouchEvent>() {
+                    listener(event, phase, window, cx)
+                }
+            },
+        )));
+    }
+
     /// Register a key event listener on this node for the next frame. The type of event
     /// is determined by the first parameter of the given listener. When the next frame is rendered
     /// the listener will be cleared.
@@ -4529,6 +4572,7 @@ impl Window {
         self.last_input_modality = match &event {
             PlatformInput::KeyDown(_) => InputModality::Keyboard,
             PlatformInput::MouseMove(_) | PlatformInput::MouseDown(_) => InputModality::Mouse,
+            PlatformInput::Touch(_) => InputModality::Touch,
             _ => self.last_input_modality,
         };
         if self.last_input_modality != old_modality {
@@ -4580,6 +4624,10 @@ impl Window {
                 self.modifiers = pinch.modifiers;
                 PlatformInput::Pinch(pinch)
             }
+            PlatformInput::Touch(touch) => {
+                self.modifiers = touch.modifiers;
+                PlatformInput::Touch(touch)
+            }
             // Translate dragging and dropping of external files from the operating system
             // to internal drag and drop events.
             PlatformInput::FileDrop(file_drop) => match file_drop {
@@ -4625,7 +4673,9 @@ impl Window {
             PlatformInput::KeyDown(_) | PlatformInput::KeyUp(_) => event,
         };
 
-        if let Some(any_mouse_event) = event.mouse_event() {
+        if let PlatformInput::Touch(touch) = &event {
+            self.dispatch_touch_event(touch, cx);
+        } else if let Some(any_mouse_event) = event.mouse_event() {
             self.dispatch_mouse_event(any_mouse_event, cx);
         } else if let Some(any_key_event) = event.keyboard_event() {
             self.dispatch_key_event(any_key_event, cx);
@@ -4703,6 +4753,69 @@ impl Window {
         if event.is::<MouseUpEvent>() && self.captured_hitbox.is_some() {
             self.captured_hitbox = None;
         }
+    }
+
+    fn dispatch_touch_event(&mut self, event: &TouchEvent, cx: &mut App) {
+        #[cfg(any(feature = "inspector", debug_assertions))]
+        if self.is_inspector_picking(cx) {
+            // Touch is not used for inspector picking.
+            return;
+        }
+
+        // Update the mouse position and hit-test before dispatching native touch
+        // events, so that listeners can use is_hovered / should_handle_scroll and
+        // occluding overlays correctly block touches to background elements.
+        self.mouse_position = event.position;
+        self.mouse_hit_test = self.rendered_frame.hit_test(self.mouse_position);
+
+        let mut touch_listeners = mem::take(&mut self.rendered_frame.touch_listeners);
+
+        // Capture phase.
+        for listener in &mut touch_listeners {
+            let listener = listener.as_mut().unwrap();
+            listener(event, DispatchPhase::Capture, self, cx);
+            if !cx.propagate_event {
+                break;
+            }
+        }
+
+        // Bubble phase.
+        if cx.propagate_event {
+            for listener in touch_listeners.iter_mut().rev() {
+                let listener = listener.as_mut().unwrap();
+                listener(event, DispatchPhase::Bubble, self, cx);
+                if !cx.propagate_event {
+                    break;
+                }
+            }
+        }
+
+        self.rendered_frame.touch_listeners = touch_listeners;
+
+        // Clean up any pending click state for this touch once the gesture is
+        // finished. Native click listeners consume it during the bubble phase,
+        // so this only removes stale entries.
+        if event.phase == TouchPhase::Ended || event.phase == TouchPhase::Cancelled {
+            self.cancel_pending_touch_click(event.id);
+        }
+    }
+
+    /// Records that a touch is waiting for a potential click on the element
+    /// that registered the touch start. Used by scroll containers to cancel
+    /// pending clicks when a touch turns into a pan gesture.
+    pub(crate) fn register_pending_touch_click(&mut self, touch_id: i32) {
+        self.pending_touch_clicks.insert(touch_id);
+    }
+
+    /// Cancels a pending touch click, e.g. because the touch turned into a
+    /// scroll gesture.
+    pub fn cancel_pending_touch_click(&mut self, touch_id: i32) {
+        self.pending_touch_clicks.remove(&touch_id);
+    }
+
+    /// Returns whether the given touch id still has a pending click.
+    pub(crate) fn is_pending_touch_click(&self, touch_id: i32) -> bool {
+        self.pending_touch_clicks.contains(&touch_id)
     }
 
     fn dispatch_key_event(&mut self, event: &dyn Any, cx: &mut App) {

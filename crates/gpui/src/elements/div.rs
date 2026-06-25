@@ -23,8 +23,8 @@ use crate::{
     KeyUpEvent, KeyboardButton, KeyboardClickEvent, LayoutId, ModifiersChangedEvent, MouseButton,
     MouseClickEvent, MouseDownEvent, MouseMoveEvent, MousePressureEvent, MouseUpEvent, Overflow,
     ParentElement, Pixels, Point, Render, ScrollWheelEvent, SharedString, Size, Style,
-    StyleRefinement, Styled, Task, TooltipId, Visibility, Window, WindowControlArea, point, px,
-    size,
+    StyleRefinement, Styled, Task, TooltipId, TouchClickEvent, TouchEvent, TouchPhase, Visibility,
+    Window, WindowControlArea, point, px, size,
 };
 use collections::HashMap;
 use gpui_util::ResultExt;
@@ -46,8 +46,18 @@ use std::{
 use super::ImageCacheProvider;
 
 const DRAG_THRESHOLD: f64 = 2.;
+const TOUCH_SCROLL_THRESHOLD: Pixels = px(8.0);
 const DEFAULT_TOOLTIP_SHOW_DELAY: Duration = Duration::from_millis(500);
 const HOVERABLE_TOOLTIP_HIDE_DELAY: Duration = Duration::from_millis(500);
+
+/// Per-touch state used by scrollable containers to recognize a drag-to-scroll
+/// gesture.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TouchScrollState {
+    start: Point<Pixels>,
+    last: Point<Pixels>,
+    scrolling: bool,
+}
 
 /// The styling information for a given group.
 pub struct GroupStyle {
@@ -1997,6 +2007,9 @@ impl Interactivity {
                     if let Some(pending_mouse_down) = element_state.pending_mouse_down.as_ref() {
                         *pending_mouse_down.borrow_mut() = None;
                     }
+                    if let Some(pending_touch_down) = element_state.pending_touch_down.as_ref() {
+                        pending_touch_down.borrow_mut().clear();
+                    }
                     if let Some(clicked_state) = element_state.clicked_state.as_ref() {
                         *clicked_state.borrow_mut() = ElementClickedState::default();
                     }
@@ -2309,7 +2322,13 @@ impl Interactivity {
                                                 window,
                                                 cx,
                                             );
-                                            self.paint_scroll_listener(hitbox, &style, window, cx);
+                                            self.paint_scroll_listener(
+                                                hitbox,
+                                                &style,
+                                                element_state.as_mut(),
+                                                window,
+                                                cx,
+                                            );
                                         }
 
                                         self.paint_keyboard_listeners(window, cx);
@@ -2771,6 +2790,7 @@ impl Interactivity {
                 }
 
                 window.on_mouse_event({
+                    let click_listeners = click_listeners.clone();
                     let mut captured_mouse_down = None;
                     let hitbox = hitbox.clone();
                     move |event: &MouseUpEvent, phase, window, cx| match phase {
@@ -2818,6 +2838,81 @@ impl Interactivity {
                         }
                     }
                 });
+
+                // Native touch click support: remember the touch down so a matching
+                // up can synthesize a ClickEvent::Touch. Don't stop propagation here;
+                // scroll listeners need to see the same touch move.
+                if !click_listeners.is_empty() {
+                    let pending_touch_down = element_state
+                        .pending_touch_down
+                        .get_or_insert_with(Default::default)
+                        .clone();
+
+                    window.on_touch_event({
+                        let pending_touch_down = pending_touch_down.clone();
+                        let hitbox = hitbox.clone();
+                        move |event: &TouchEvent, phase, window, _cx| {
+                            if phase == DispatchPhase::Bubble
+                                && event.phase == TouchPhase::Started
+                                && hitbox.is_hovered(window)
+                            {
+                                pending_touch_down
+                                    .borrow_mut()
+                                    .insert(event.id, event.clone());
+                                window.register_pending_touch_click(event.id);
+                                window.refresh();
+                            }
+                        }
+                    });
+
+                    window.on_touch_event({
+                        let mut captured_touch_down = None;
+                        let hitbox = hitbox.clone();
+                        let pending_touch_down = pending_touch_down.clone();
+                        move |event: &TouchEvent, phase, window, cx| {
+                            if event.phase != TouchPhase::Ended
+                                && event.phase != TouchPhase::Cancelled
+                            {
+                                return;
+                            }
+
+                            match phase {
+                                DispatchPhase::Capture => {
+                                    let mut pending_touch_down = pending_touch_down.borrow_mut();
+                                    if pending_touch_down.get(&event.id).is_some() {
+                                        if event.phase == TouchPhase::Ended
+                                            && window.is_pending_touch_click(event.id)
+                                            && hitbox.is_hovered(window)
+                                        {
+                                            captured_touch_down =
+                                                pending_touch_down.remove(&event.id);
+                                        } else {
+                                            // The touch was cancelled by a scroll gesture or the
+                                            // platform; clear the pending down without firing a click.
+                                            pending_touch_down.remove(&event.id);
+                                        }
+                                        window.refresh();
+                                    }
+                                }
+                                DispatchPhase::Bubble => {
+                                    if event.phase == TouchPhase::Ended {
+                                        if let Some(touch_down) = captured_touch_down.take() {
+                                            let touch_click = ClickEvent::Touch(TouchClickEvent {
+                                                down: touch_down,
+                                                up: event.clone(),
+                                            });
+                                            for listener in &click_listeners {
+                                                listener(&touch_click, window, cx);
+                                            }
+                                            window.cancel_pending_touch_click(event.id);
+                                            cx.stop_propagation();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
             }
 
             if let Some(hover_listener) = self.hover_listener.take() {
@@ -2985,6 +3080,7 @@ impl Interactivity {
         &self,
         hitbox: &Hitbox,
         style: &Style,
+        element_state: Option<&mut InteractiveElementState>,
         window: &mut Window,
         _cx: &mut App,
     ) {
@@ -2993,10 +3089,10 @@ impl Interactivity {
             let allow_concurrent_scroll = style.allow_concurrent_scroll;
             let restrict_scroll_to_axis = style.restrict_scroll_to_axis;
             let line_height = window.line_height();
-            let hitbox = hitbox.clone();
+            let scroll_hitbox = hitbox.clone();
             let current_view = window.current_view();
             window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
-                if phase == DispatchPhase::Bubble && hitbox.should_handle_scroll(window) {
+                if phase == DispatchPhase::Bubble && scroll_hitbox.should_handle_scroll(window) {
                     let mut scroll_offset = scroll_offset.borrow_mut();
                     let old_scroll_offset = *scroll_offset;
                     let delta = event.delta.pixel_delta(line_height);
@@ -3029,6 +3125,105 @@ impl Interactivity {
                     if *scroll_offset != old_scroll_offset {
                         cx.notify(current_view);
                     }
+                }
+            });
+
+            let pending_touch_scroll = element_state
+                .and_then(|state| state.pending_touch_scroll.as_ref().cloned())
+                .unwrap_or_else(|| Rc::new(RefCell::new(None)));
+            let touch_hitbox = hitbox.clone();
+            let scroll_offset = self.scroll_offset.clone().unwrap();
+            let current_view = window.current_view();
+            window.on_touch_event(move |event: &TouchEvent, phase, window, cx| {
+                if !touch_hitbox.should_handle_scroll(window) {
+                    return;
+                }
+
+                let mut state = pending_touch_scroll.borrow_mut();
+                match (event.phase, phase) {
+                    // Record the touch start in capture phase so that scroll dragging
+                    // still works when a child element consumes the Started event in
+                    // bubble phase (e.g. a clickable list row).
+                    (TouchPhase::Started, DispatchPhase::Capture) => {
+                        *state = Some(TouchScrollState {
+                            start: event.position,
+                            last: event.position,
+                            scrolling: false,
+                        });
+                    }
+                    (TouchPhase::Moved, DispatchPhase::Bubble) => {
+                        if let Some(ref mut s) = *state {
+                            if !s.scrolling {
+                                let dx = event.position.x - s.start.x;
+                                let dy = event.position.y - s.start.y;
+                                if dx.abs() > TOUCH_SCROLL_THRESHOLD
+                                    || dy.abs() > TOUCH_SCROLL_THRESHOLD
+                                {
+                                    s.scrolling = true;
+                                    window.cancel_pending_touch_click(event.id);
+                                }
+                            }
+
+                            if s.scrolling {
+                                let delta = event.position - s.last;
+                                s.last = event.position;
+                                drop(state);
+
+                                let mut scroll_offset = scroll_offset.borrow_mut();
+                                let old_scroll_offset = *scroll_offset;
+
+                                let mut delta_x = Pixels::ZERO;
+                                if overflow.x == Overflow::Scroll {
+                                    if !delta.x.is_zero() {
+                                        delta_x = delta.x;
+                                    } else if !restrict_scroll_to_axis
+                                        && overflow.y != Overflow::Scroll
+                                    {
+                                        delta_x = delta.y;
+                                    }
+                                }
+                                let mut delta_y = Pixels::ZERO;
+                                if overflow.y == Overflow::Scroll {
+                                    if !delta.y.is_zero() {
+                                        delta_y = delta.y;
+                                    } else if !restrict_scroll_to_axis
+                                        && overflow.x != Overflow::Scroll
+                                    {
+                                        delta_y = delta.x;
+                                    }
+                                }
+                                if !allow_concurrent_scroll
+                                    && !delta_x.is_zero()
+                                    && !delta_y.is_zero()
+                                {
+                                    if delta_x.abs() > delta_y.abs() {
+                                        delta_y = Pixels::ZERO;
+                                    } else {
+                                        delta_x = Pixels::ZERO;
+                                    }
+                                }
+
+                                scroll_offset.y += delta_y;
+                                scroll_offset.x += delta_x;
+                                if *scroll_offset != old_scroll_offset {
+                                    cx.notify(current_view);
+                                }
+                                cx.stop_propagation();
+                            }
+                        }
+                    }
+                    (TouchPhase::Ended, DispatchPhase::Bubble) => {
+                        if let Some(ref s) = *state {
+                            if s.scrolling {
+                                cx.stop_propagation();
+                            }
+                        }
+                        *state = None;
+                    }
+                    (TouchPhase::Cancelled, _) => {
+                        *state = None;
+                    }
+                    _ => {}
                 }
             });
         }
@@ -3257,6 +3452,8 @@ pub struct InteractiveElementState {
     /// press (mirroring the browser clearing a control's pressed state on
     /// blur). `None` means no activation key is pending.
     pub(crate) pending_keyboard_down: Option<Rc<RefCell<Option<u64>>>>,
+    pub(crate) pending_touch_down: Option<Rc<RefCell<HashMap<i32, TouchEvent>>>>,
+    pub(crate) pending_touch_scroll: Option<Rc<RefCell<Option<TouchScrollState>>>>,
     pub(crate) scroll_offset: Option<Rc<RefCell<Point<Pixels>>>>,
     pub(crate) active_tooltip: Option<Rc<RefCell<Option<ActiveTooltip>>>>,
 }

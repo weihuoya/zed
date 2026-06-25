@@ -706,6 +706,12 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
         Decorations::Server
     }
     fn set_app_id(&mut self, _app_id: &str) {}
+
+    /// Set the layer-shell surface margin (top, right, bottom, left).
+    /// Only meaningful on Wayland layer-shell windows.
+    #[cfg(all(target_os = "linux", feature = "wayland"))]
+    fn set_layer_shell_margin(&self, _margin: (Pixels, Pixels, Pixels, Pixels)) {}
+
     fn map_window(&mut self) -> anyhow::Result<()> {
         Ok(())
     }

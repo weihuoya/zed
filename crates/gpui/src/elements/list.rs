@@ -11,7 +11,7 @@ use crate::{
     AnyElement, App, AvailableSpace, Bounds, ContentMask, DispatchPhase, Edges, Element, EntityId,
     FocusHandle, GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, IntoElement,
     Overflow, Pixels, Point, ScrollDelta, ScrollWheelEvent, Size, Style, StyleRefinement, Styled,
-    Window, point, px, size,
+    TouchEvent, TouchPhase, Window, point, px, size,
 };
 use collections::VecDeque;
 use refineable::Refineable as _;
@@ -19,6 +19,8 @@ use std::{cell::RefCell, ops::Range, rc::Rc};
 use sum_tree::{Bias, Dimensions, SumTree};
 
 type RenderItemFn = dyn FnMut(usize, &mut Window, &mut App) -> AnyElement + 'static;
+
+const LIST_TOUCH_SCROLL_THRESHOLD: Pixels = px(8.0);
 
 /// Construct a new list element
 pub fn list(
@@ -73,6 +75,10 @@ struct StateInner {
     measuring_behavior: ListMeasuringBehavior,
     pending_scroll: Option<PendingScroll>,
     follow_state: FollowState,
+    /// Native touch drag-to-scroll state, persisted across frames.
+    touch_start: Option<Point<Pixels>>,
+    touch_last: Option<Point<Pixels>>,
+    touch_scrolling: bool,
 }
 
 /// Deferred scroll adjustment applied after the scroll-top item has been remeasured.
@@ -325,6 +331,9 @@ impl ListState {
             measuring_behavior: ListMeasuringBehavior::default(),
             pending_scroll: None,
             follow_state: FollowState::default(),
+            touch_start: None,
+            touch_last: None,
+            touch_scrolling: false,
         })));
         this.splice(0..0, item_count);
         this
@@ -349,6 +358,9 @@ impl ListState {
             state.logical_scroll_top = None;
             state.pending_scroll = None;
             state.scrollbar_drag_start_height = None;
+            state.touch_start = None;
+            state.touch_last = None;
+            state.touch_scrolling = false;
             state.items.summary().count
         };
 
@@ -906,6 +918,20 @@ impl StateInner {
         }
 
         cx.notify(current_view);
+    }
+
+    /// Scroll the list by the given delta relative to its current logical scroll top.
+    /// Used by native touch drag-to-scroll, where the baseline changes every frame.
+    fn scroll_by(
+        &mut self,
+        height: Pixels,
+        delta_y: Pixels,
+        current_view: EntityId,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let scroll_top = self.logical_scroll_top();
+        self.scroll(&scroll_top, height, point(px(0.), delta_y), current_view, window, cx);
     }
 
     fn logical_scroll_top(&self) -> ListOffset {
@@ -1559,6 +1585,66 @@ impl Element for List {
                     window,
                     cx,
                 )
+            }
+        });
+
+        // Native touch drag-to-scroll for `List` (used by gpui-component Settings, etc.).
+        let bounds = bounds;
+        let list_state = self.state.clone();
+        let height = bounds.size.height;
+        let current_view = window.current_view();
+        window.on_touch_event(move |event: &TouchEvent, phase, window, cx| {
+            if !hitbox_id.should_handle_scroll(window) {
+                return;
+            }
+
+            match (event.phase, phase) {
+                (TouchPhase::Started, DispatchPhase::Capture) => {
+                    let mut state = list_state.0.borrow_mut();
+                    state.touch_start = Some(event.position);
+                    state.touch_last = Some(event.position);
+                    state.touch_scrolling = false;
+                }
+                (TouchPhase::Moved, DispatchPhase::Bubble) => {
+                    let mut state = list_state.0.borrow_mut();
+                    if state.touch_start.is_some() {
+                        if !state.touch_scrolling {
+                            let start = state.touch_start.unwrap();
+                            let dx = event.position.x - start.x;
+                            let dy = event.position.y - start.y;
+                            if dx.abs() > LIST_TOUCH_SCROLL_THRESHOLD
+                                || dy.abs() > LIST_TOUCH_SCROLL_THRESHOLD
+                            {
+                                state.touch_scrolling = true;
+                                window.cancel_pending_touch_click(event.id);
+                            }
+                        }
+
+                        if state.touch_scrolling {
+                            let last = state.touch_last.unwrap();
+                            let delta_y = event.position.y - last.y;
+                            state.touch_last = Some(event.position);
+                            state.scroll_by(height, delta_y, current_view, window, cx);
+                            cx.stop_propagation();
+                        }
+                    }
+                }
+                (TouchPhase::Ended, DispatchPhase::Bubble) => {
+                    let mut state = list_state.0.borrow_mut();
+                    if state.touch_scrolling {
+                        cx.stop_propagation();
+                    }
+                    state.touch_start = None;
+                    state.touch_last = None;
+                    state.touch_scrolling = false;
+                }
+                (TouchPhase::Cancelled, _) => {
+                    let mut state = list_state.0.borrow_mut();
+                    state.touch_start = None;
+                    state.touch_last = None;
+                    state.touch_scrolling = false;
+                }
+                _ => {}
             }
         });
     }
