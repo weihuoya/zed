@@ -1831,6 +1831,20 @@ impl PlatformWindow for WaylandWindow {
         state.app_id = Some(app_id.to_owned());
     }
 
+    #[cfg(feature = "wayland")]
+    fn set_layer_shell_margin(&self, margin: (Pixels, Pixels, Pixels, Pixels)) {
+        let state = self.borrow();
+        if let Some(layer_surface) = state.surface_state.layer_surface() {
+            layer_surface.set_margin(
+                f32::from(margin.0) as i32,
+                f32::from(margin.1) as i32,
+                f32::from(margin.2) as i32,
+                f32::from(margin.3) as i32,
+            );
+            state.surface.commit();
+        }
+    }
+
     fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance) {
         let mut state = self.borrow_mut();
         if state.background_appearance == background_appearance {

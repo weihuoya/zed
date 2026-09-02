@@ -12,17 +12,18 @@ use crate::{
     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
     Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
     KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite,
-    MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas,
-    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite,
-    Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage,
-    RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
+    MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels,
+    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
+    PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
+    RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
     SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
     StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
     SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextInputConfiguration,
-    TextInputStateChange, TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState,
-    TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
-    WindowBounds, WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
-    WindowVisibility, point, prelude::*, px, rems, size, transparent_black,
+    TextInputStateChange, TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState, TouchId,
+    TouchPhase, TransformationMatrix, Underline, UnderlineStyle, WindowAppearance,
+    WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations, WindowOptions,
+    WindowParams, WindowTextSystem, WindowVisibility, point, prelude::*, px, rems, size,
+    transparent_black,
 };
 
 use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
@@ -981,6 +982,7 @@ pub(crate) struct Frame {
     pub(crate) element_states: FxHashMap<(GlobalElementId, TypeId), ElementStateBox>,
     accessed_element_states: Vec<(GlobalElementId, TypeId)>,
     pub(crate) mouse_listeners: Vec<Option<AnyMouseListener>>,
+    pub(crate) touch_listeners: Vec<Option<AnyMouseListener>>,
     pub(crate) dispatch_tree: DispatchTree,
     pub(crate) scene: Scene,
     pub(crate) hitboxes: Vec<Hitbox>,
@@ -1012,6 +1014,7 @@ pub(crate) struct PrepaintStateIndex {
 pub(crate) struct PaintIndex {
     scene_index: usize,
     mouse_listeners_index: usize,
+    touch_listeners_index: usize,
     input_handlers_index: usize,
     cursor_styles_index: usize,
     accessed_element_states_index: usize,
@@ -1027,6 +1030,7 @@ impl Frame {
             element_states: FxHashMap::default(),
             accessed_element_states: Vec::new(),
             mouse_listeners: Vec::new(),
+            touch_listeners: Vec::new(),
             dispatch_tree,
             scene: Scene::default(),
             hitboxes: Vec::new(),
@@ -1052,6 +1056,7 @@ impl Frame {
         self.element_states.clear();
         self.accessed_element_states.clear();
         self.mouse_listeners.clear();
+        self.touch_listeners.clear();
         self.dispatch_tree.clear();
         self.scene.clear();
         self.input_handlers.clear();
@@ -1187,6 +1192,14 @@ pub struct Window {
     default_prevented: bool,
     mouse_position: Point<Pixels>,
     mouse_hit_test: HitTest,
+    /// The touch that started the currently active drag, if it was
+    /// touch-initiated. Cleared (with a synthesized mouse-up) when the touch
+    /// ends.
+    pub(crate) active_touch_drag: Option<TouchId>,
+    /// A touch claimed by a raw touch listener (via `stop_propagation`). The
+    /// gesture recognizer still tracks it to keep its state coherent, but its
+    /// recognized output is suppressed for the rest of the touch.
+    touch_claimed_by_listener: Option<TouchId>,
     modifiers: Modifiers,
     capslock: Capslock,
     scale_factor: f32,
@@ -2043,6 +2056,8 @@ impl Window {
             default_prevented: true,
             mouse_position,
             mouse_hit_test: HitTest::default(),
+            active_touch_drag: None,
+            touch_claimed_by_listener: None,
             modifiers,
             capslock,
             scale_factor,
@@ -2882,6 +2897,13 @@ impl Window {
     /// Sets the application identifier.
     pub fn set_app_id(&mut self, app_id: &str) {
         self.platform_window.set_app_id(app_id);
+    }
+
+    /// Sets the layer-shell surface margin (top, right, bottom, left).
+    /// Only has an effect on Wayland layer-shell windows.
+    #[cfg(all(target_os = "linux", feature = "wayland"))]
+    pub fn set_layer_shell_margin(&self, margin: (Pixels, Pixels, Pixels, Pixels)) {
+        self.platform_window.set_layer_shell_margin(margin);
     }
 
     /// Sets the window background appearance.
@@ -3861,6 +3883,7 @@ impl Window {
         PaintIndex {
             scene_index: self.next_frame.scene.len(),
             mouse_listeners_index: self.next_frame.mouse_listeners.len(),
+            touch_listeners_index: self.next_frame.touch_listeners.len(),
             input_handlers_index: self.next_frame.input_handlers.len(),
             cursor_styles_index: self.next_frame.cursor_styles.len(),
             accessed_element_states_index: self.next_frame.accessed_element_states.len(),
@@ -3885,6 +3908,12 @@ impl Window {
         self.next_frame.mouse_listeners.extend(
             self.rendered_frame.mouse_listeners
                 [range.start.mouse_listeners_index..range.end.mouse_listeners_index]
+                .iter_mut()
+                .map(|listener| listener.take()),
+        );
+        self.next_frame.touch_listeners.extend(
+            self.rendered_frame.touch_listeners
+                [range.start.touch_listeners_index..range.end.touch_listeners_index]
                 .iter_mut()
                 .map(|listener| listener.take()),
         );
@@ -5251,6 +5280,28 @@ impl Window {
         )));
     }
 
+    /// Register a touch event listener on this node for the next frame.
+    ///
+    /// This is separate from `on_mouse_event` so that touch input is not treated
+    /// as a mouse event. When the next frame is rendered the listener will be
+    /// cleared.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn on_touch_event(
+        &mut self,
+        mut listener: impl FnMut(&TouchEvent, DispatchPhase, &mut Window, &mut App) + 'static,
+    ) {
+        self.invalidator.debug_assert_paint();
+
+        self.next_frame.touch_listeners.push(Some(Box::new(
+            move |event: &dyn Any, phase: DispatchPhase, window: &mut Window, cx: &mut App| {
+                if let Some(event) = event.downcast_ref::<TouchEvent>() {
+                    listener(event, phase, window, cx)
+                }
+            },
+        )));
+    }
+
     /// Register a key event listener on this node for the next frame. The type of event
     /// is determined by the first parameter of the given listener. When the next frame is rendered
     /// the listener will be cleared.
@@ -5614,42 +5665,131 @@ impl Window {
     /// Runs the portable gesture recognizer over a raw touch event and
     /// dispatches whatever it resolves (scroll steps, synthesized taps)
     /// through the ordinary mouse-event path.
+    ///
+    /// Before recognition the raw event is delivered to element touch
+    /// listeners (see [`Window::on_touch_event`]). A listener that stops
+    /// propagation claims the touch: the recognizer still tracks it to keep
+    /// its state coherent, but its recognized output is suppressed for the
+    /// rest of the touch.
     fn dispatch_touch_event(&mut self, event: &TouchEvent, cx: &mut App) {
+        #[cfg(any(feature = "inspector", debug_assertions))]
+        if self.is_inspector_picking(cx) {
+            // Touch is not used for inspector picking.
+            return;
+        }
+
+        // Update the mouse position and hit-test before dispatching raw touch
+        // events, so that listeners can use is_hovered / should_handle_scroll
+        // and occluding overlays correctly block touches to background
+        // elements.
+        self.mouse_position = event.position;
+        self.mouse_hit_test = self.rendered_frame.hit_test(self.mouse_position);
+
+        if event.phase == TouchPhase::Started {
+            self.touch_claimed_by_listener = None;
+        }
+
+        let mut touch_listeners = mem::take(&mut self.rendered_frame.touch_listeners);
+
+        // Capture phase.
+        for listener in &mut touch_listeners {
+            let listener = listener.as_mut().unwrap();
+            listener(event, DispatchPhase::Capture, self, cx);
+            if !cx.propagate_event {
+                break;
+            }
+        }
+
+        // Bubble phase.
+        if cx.propagate_event {
+            for listener in touch_listeners.iter_mut().rev() {
+                let listener = listener.as_mut().unwrap();
+                listener(event, DispatchPhase::Bubble, self, cx);
+                if !cx.propagate_event {
+                    break;
+                }
+            }
+        }
+
+        self.rendered_frame.touch_listeners = touch_listeners;
+
+        if !cx.propagate_event {
+            self.touch_claimed_by_listener = Some(event.id);
+            cx.propagate_event = true;
+        }
+        let claimed = self.touch_claimed_by_listener == Some(event.id);
+
+        // A touch-started drag ends when the touch ends. Deliver the mouse-up
+        // the mouse path would have produced (clears `cx.active_drag` and lets
+        // drag consumers like sliders see the release). This must run while
+        // the hit test still reflects the final touch position: hover-gated
+        // mouse-up handlers would otherwise see the reset (-1, -1) position
+        // and never fire.
+        if matches!(event.phase, TouchPhase::Ended | TouchPhase::Cancelled)
+            && self.active_touch_drag == Some(event.id)
+        {
+            self.active_touch_drag = None;
+            self.dispatch_mouse_event(
+                &MouseUpEvent {
+                    button: MouseButton::Left,
+                    position: event.position,
+                    modifiers: Modifiers::default(),
+                    click_count: 1,
+                },
+                cx,
+            );
+        }
+
         let mut event = event.clone();
         if !self.touch_prediction_enabled {
             event.predicted_position = None;
         }
         let recognized_gestures = self.touch_gestures.handle_event(&event);
-        if event.phase == crate::TouchPhase::Started
-            && let Some(touch_drag) = self.touch_gestures.offer_touch_drag(event.id)
-        {
-            self.dispatch_recognized_touch_gesture(touch_drag, cx);
-        }
-        if event.phase == crate::TouchPhase::Started
-            && self.touch_gestures.pending_long_press().is_some()
-        {
-            self.long_press_capture = None;
-        }
-        let mut tapped = false;
-        for gesture in recognized_gestures {
-            tapped |= matches!(gesture, RecognizedTouchGesture::Tap { .. });
-            self.dispatch_recognized_touch_gesture(gesture, cx);
-        }
-        if event.phase == crate::TouchPhase::Started {
-            self.schedule_long_press_timer(cx);
-        } else if self.touch_gestures.pending_long_press().is_none() {
+        if claimed {
+            // A raw touch listener claimed this touch: drop the recognized
+            // output and any pending long-press timer.
             self.long_press_timer.take();
+        } else {
+            if event.phase == crate::TouchPhase::Started
+                && let Some(touch_drag) = self.touch_gestures.offer_touch_drag(event.id)
+            {
+                self.dispatch_recognized_touch_gesture(touch_drag, cx);
+            }
+            if event.phase == crate::TouchPhase::Started
+                && self.touch_gestures.pending_long_press().is_some()
+            {
+                self.long_press_capture = None;
+            }
+            let mut tapped = false;
+            for gesture in recognized_gestures {
+                tapped |= matches!(gesture, RecognizedTouchGesture::Tap { .. });
+                self.dispatch_recognized_touch_gesture(gesture, cx);
+            }
+            if event.phase == crate::TouchPhase::Started {
+                self.schedule_long_press_timer(cx);
+            } else if self.touch_gestures.pending_long_press().is_none() {
+                self.long_press_timer.take();
+            }
+            // The platform's touch-release handler may inspect the input handler
+            // as soon as this dispatch returns (the web platform decides virtual
+            // keyboard visibility there, inside the user gesture). Input handlers
+            // are registered during draw, so draw now to make them reflect any
+            // focus change the tap just caused.
+            if tapped && self.invalidator.is_dirty() {
+                self.draw(cx).clear(cx);
+            }
+            if self.touch_gestures.has_momentum() {
+                self.schedule_touch_momentum_tick();
+            }
         }
-        // The platform's touch-release handler may inspect the input handler
-        // as soon as this dispatch returns (the web platform decides virtual
-        // keyboard visibility there, inside the user gesture). Input handlers
-        // are registered during draw, so draw now to make them reflect any
-        // focus change the tap just caused.
-        if tapped && self.invalidator.is_dirty() {
-            self.draw(cx).clear(cx);
-        }
-        if self.touch_gestures.has_momentum() {
-            self.schedule_touch_momentum_tick();
+
+        if matches!(event.phase, TouchPhase::Ended | TouchPhase::Cancelled) {
+            self.touch_claimed_by_listener = None;
+            // After the finger is lifted there is no pointer hovering over the
+            // window. Reset the mouse position so that hover styles don't stick
+            // to the last touch location on pure touch devices.
+            self.mouse_position = point(px(-1.0), px(-1.0));
+            self.mouse_hit_test = HitTest::default();
         }
     }
 
