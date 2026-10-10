@@ -866,6 +866,35 @@ impl PlatformInput {
             _ => None,
         }
     }
+
+    /// Returns the position associated with this input event, if any.
+    ///
+    /// This includes mouse, touch, and gesture events so that downstream code
+    /// such as tooltips and context menus can position themselves relative to
+    /// the last input location regardless of input modality.
+    pub fn event_position(&self) -> Option<Point<Pixels>> {
+        match self {
+            PlatformInput::KeyDown(_) => None,
+            PlatformInput::KeyUp(_) => None,
+            PlatformInput::ModifiersChanged(_) => None,
+            PlatformInput::MouseDown(event) => Some(event.position),
+            PlatformInput::MouseUp(event) => Some(event.position),
+            PlatformInput::MouseMove(event) => Some(event.position),
+            PlatformInput::MousePressure(event) => Some(event.position),
+            PlatformInput::MouseExited(event) => Some(event.position),
+            PlatformInput::ScrollWheel(event) => Some(event.position),
+            PlatformInput::Pinch(event) => Some(event.position),
+            PlatformInput::LongPress(event) => Some(event.position),
+            PlatformInput::TouchDrag(event) => Some(event.position),
+            PlatformInput::Touch(event) => Some(event.position),
+            PlatformInput::FileDrop(event) => match event {
+                FileDropEvent::Entered { position, .. }
+                | FileDropEvent::Pending { position }
+                | FileDropEvent::Submit { position } => Some(*position),
+                FileDropEvent::Exited | FileDropEvent::Ended => None,
+            },
+        }
+    }
 }
 
 #[cfg(test)]

@@ -20,11 +20,11 @@ use crate::{
     Display, Element, ElementId, Entity, EntityId, ExternalDragPayload, ExternalDragPayloadSource,
     FileDropEvent, FocusHandle, Global, GlobalElementId, Hitbox, HitboxBehavior, HitboxId,
     InspectorElementId, IntoElement, IsZero, KeyContext, KeyDownEvent, KeyUpEvent, KeyboardButton,
-    KeyboardClickEvent, LayoutId, LongPressEvent, ModifiersChangedEvent, MouseButton,
+    KeyboardClickEvent, LayoutId, LongPressEvent, Modifiers, ModifiersChangedEvent, MouseButton,
     MouseClickEvent, MouseDownEvent, MouseExitEvent, MouseMoveEvent, MousePressureEvent,
     MouseUpEvent, OngoingScroll, Overflow, ParentElement, PinchEvent, Pixels, Point, Render,
     ScrollWheelEvent, SharedString, Size, Style, StyleRefinement, Styled, Task, TooltipId,
-    TouchPhase, Visibility, Window, WindowControlArea, point, px, size,
+    TouchEvent, TouchId, TouchPhase, Visibility, Window, WindowControlArea, point, px, size,
 };
 use collections::HashMap;
 use gpui_util::ResultExt;
@@ -182,6 +182,34 @@ impl Interactivity {
         self.mouse_pressure_listeners
             .push(Box::new(move |event, phase, hitbox, window, cx| {
                 if phase == DispatchPhase::Bubble && hitbox.is_hovered(window) {
+                    (listener)(event, window, cx)
+                }
+            }));
+    }
+
+    /// Bind the given callback to touch events, during the bubble phase and only
+    /// while the touch is within this element's hitbox.
+    pub fn on_touch_event(
+        &mut self,
+        listener: impl Fn(&TouchEvent, &mut Window, &mut App) + 'static,
+    ) {
+        self.touch_event_listeners
+            .push(Box::new(move |event, phase, hitbox, window, cx| {
+                if phase == DispatchPhase::Bubble && hitbox.is_hovered(window) {
+                    (listener)(event, window, cx)
+                }
+            }));
+    }
+
+    /// Bind the given callback to touch events, during the capture phase and only
+    /// while the touch is within this element's hitbox.
+    pub fn capture_touch_event(
+        &mut self,
+        listener: impl Fn(&TouchEvent, &mut Window, &mut App) + 'static,
+    ) {
+        self.touch_event_listeners
+            .push(Box::new(move |event, phase, hitbox, window, cx| {
+                if phase == DispatchPhase::Capture && hitbox.is_hovered(window) {
                     (listener)(event, window, cx)
                 }
             }));
@@ -363,15 +391,45 @@ impl Interactivity {
     ) where
         T: 'static,
     {
+        let listener = Rc::new(listener);
         self.mouse_move_listeners
-            .push(Box::new(move |event, phase, hitbox, window, cx| {
-                if phase == DispatchPhase::Capture
+            .push(Box::new({
+                let listener = listener.clone();
+                move |event, phase, hitbox, window, cx| {
+                    if phase == DispatchPhase::Capture
+                        && let Some(drag) = &cx.active_drag
+                        && drag.value.as_ref().type_id() == TypeId::of::<T>()
+                    {
+                        (listener)(
+                            &DragMoveEvent {
+                                event: event.clone(),
+                                bounds: hitbox.bounds,
+                                drag: PhantomData,
+                                dragged_item: Arc::clone(&drag.value),
+                            },
+                            window,
+                            cx,
+                        );
+                    }
+                }
+            }));
+        // Touch drags (see the touch-drag synthesis in paint_mouse_listeners)
+        // deliver moves as DragMoveEvents with a synthesized mouse-move
+        // payload; drag consumers can't tell the modalities apart.
+        self.touch_event_listeners
+            .push(Box::new(move |event: &TouchEvent, phase, hitbox, window, cx| {
+                if phase == DispatchPhase::Bubble
+                    && event.phase == TouchPhase::Moved
                     && let Some(drag) = &cx.active_drag
                     && drag.value.as_ref().type_id() == TypeId::of::<T>()
                 {
                     (listener)(
                         &DragMoveEvent {
-                            event: event.clone(),
+                            event: MouseMoveEvent {
+                                position: event.position,
+                                pressed_button: Some(MouseButton::Left),
+                                modifiers: Modifiers::default(),
+                            },
                             bounds: hitbox.bounds,
                             drag: PhantomData,
                             dragged_item: Arc::clone(&drag.value),
@@ -969,6 +1027,26 @@ pub trait InteractiveElement: Sized {
         listener: impl Fn(&MousePressureEvent, &mut Window, &mut App) + 'static,
     ) -> Self {
         self.interactivity().capture_mouse_pressure(listener);
+        self
+    }
+
+    /// Bind the given callback to touch events, during the bubble phase and only
+    /// while the touch is within this element's hitbox.
+    fn on_touch_event(
+        mut self,
+        listener: impl Fn(&TouchEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.interactivity().on_touch_event(listener);
+        self
+    }
+
+    /// Bind the given callback to touch events, during the capture phase and only
+    /// while the touch is within this element's hitbox.
+    fn capture_touch_event(
+        mut self,
+        listener: impl Fn(&TouchEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.interactivity().capture_touch_event(listener);
         self
     }
 
@@ -1734,6 +1812,9 @@ pub(crate) type ScrollWheelListener =
 pub(crate) type PinchListener =
     Box<dyn Fn(&PinchEvent, DispatchPhase, &Hitbox, &mut Window, &mut App) + 'static>;
 
+pub(crate) type TouchEventListener =
+    Box<dyn Fn(&TouchEvent, DispatchPhase, &Hitbox, &mut Window, &mut App) + 'static>;
+
 pub(crate) type ClickListener = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
 
 /// Controls how [`StatefulInteractiveElement::on_hover`] responds to key presses while the mouse
@@ -2168,6 +2249,7 @@ pub struct Interactivity {
     pub(crate) mouse_pressure_listeners: Vec<MousePressureListener>,
     pub(crate) mouse_move_listeners: Vec<MouseMoveListener>,
     pub(crate) mouse_exit_listeners: Vec<MouseExitListener>,
+    pub(crate) touch_event_listeners: Vec<TouchEventListener>,
     pub(crate) file_drop_exit_listeners: Vec<FileDropExitListener>,
     pub(crate) scroll_wheel_listeners: Vec<ScrollWheelListener>,
     pub(crate) pinch_listeners: Vec<PinchListener>,
@@ -2242,6 +2324,9 @@ impl Interactivity {
                 {
                     if let Some(pending_mouse_down) = element_state.pending_mouse_down.as_ref() {
                         *pending_mouse_down.borrow_mut() = None;
+                    }
+                    if let Some(pending_touch_down) = element_state.pending_touch_down.as_ref() {
+                        pending_touch_down.borrow_mut().clear();
                     }
                     if let Some(clicked_state) = element_state.clicked_state.as_ref() {
                         *clicked_state.borrow_mut() = ElementClickedState::default();
@@ -2800,6 +2885,13 @@ impl Interactivity {
             })
         }
 
+        for listener in self.touch_event_listeners.drain(..) {
+            let hitbox = hitbox.clone();
+            window.on_touch_event(move |event: &TouchEvent, phase, window, cx| {
+                listener(event, phase, &hitbox, window, cx);
+            })
+        }
+
         for listener in self.mouse_pressure_listeners.drain(..) {
             let hitbox = hitbox.clone();
             window.on_mouse_event(move |event: &MousePressureEvent, phase, window, cx| {
@@ -2894,7 +2986,10 @@ impl Interactivity {
 
         let drag_cursor_style = self.base_style.as_ref().mouse_cursor;
 
-        let mut drag_listener = mem::take(&mut self.drag_listener);
+        // Shared between the mouse and touch drag paths: whichever modality
+        // starts a drag first takes the listener out.
+        let drag_listener = mem::take(&mut self.drag_listener)
+            .map(|listener| Rc::new(RefCell::new(Some(listener))));
         let drop_listeners = mem::take(&mut self.drop_listeners);
         let click_listeners = mem::take(&mut self.click_listeners);
         let aux_click_listeners = mem::take(&mut self.aux_click_listeners);
@@ -2971,6 +3066,7 @@ impl Interactivity {
                 window.on_mouse_event({
                     let pending_mouse_down = pending_mouse_down.clone();
                     let hitbox = hitbox.clone();
+                    let drag_listener = drag_listener.clone();
                     move |event: &MouseMoveEvent, phase, window, cx| {
                         if phase == DispatchPhase::Capture {
                             return;
@@ -2980,7 +3076,9 @@ impl Interactivity {
                         if let Some(mouse_down) = pending_mouse_down.clone()
                             && !cx.has_active_drag()
                             && (event.position - mouse_down.position).magnitude() > DRAG_THRESHOLD
-                            && let Some(listener) = drag_listener.take()
+                            && let Some(listener) = drag_listener
+                                .as_ref()
+                                .and_then(|shared| shared.borrow_mut().take())
                             && mouse_down.button == MouseButton::Left
                         {
                             *clicked_state.borrow_mut() = ElementClickedState::default();
@@ -3128,6 +3226,97 @@ impl Interactivity {
                         }
                     }
                 });
+
+                // Touch drag synthesis: a touch that moves past the drag
+                // threshold on an element with a drag listener starts an
+                // active drag, mirroring the mouse-down + move path. The drag
+                // ends (with a synthesized mouse-up) in
+                // `Window::dispatch_touch_event` when the touch ends.
+                if let Some(drag_listener) = drag_listener.clone() {
+                    let pending_touch_down = element_state
+                        .pending_touch_down
+                        .get_or_insert_with(Default::default)
+                        .clone();
+                    let hitbox = hitbox.clone();
+
+                    // Remember where each touch started so a matching move can
+                    // be checked against the drag threshold.
+                    window.on_touch_event({
+                        let pending_touch_down = pending_touch_down.clone();
+                        let hitbox = hitbox.clone();
+                        move |event: &TouchEvent, phase, window, _cx| {
+                            if phase == DispatchPhase::Bubble
+                                && event.phase == TouchPhase::Started
+                                && hitbox.is_hovered(window)
+                            {
+                                pending_touch_down
+                                    .borrow_mut()
+                                    .insert(event.id, event.clone());
+                                window.refresh();
+                            }
+                        }
+                    });
+
+                    // Capture phase so the drag starts before any enclosing
+                    // element's touch handlers can claim the move.
+                    window.on_touch_event(move |event: &TouchEvent, phase, window, cx| {
+                        if phase != DispatchPhase::Capture {
+                            return;
+                        }
+                        match event.phase {
+                            TouchPhase::Moved => {
+                                if cx.has_active_drag() {
+                                    return;
+                                }
+                                let Some(down) =
+                                    pending_touch_down.borrow().get(&event.id).cloned()
+                                else {
+                                    return;
+                                };
+                                if (event.position - down.position).magnitude()
+                                    <= DRAG_THRESHOLD
+                                {
+                                    return;
+                                }
+                                let Some(listener) = drag_listener.borrow_mut().take()
+                                else {
+                                    return;
+                                };
+                                let cursor_offset = event.position - hitbox.origin;
+                                let drag = (listener.render)(
+                                    listener.value.as_ref(),
+                                    cursor_offset,
+                                    window,
+                                    cx,
+                                );
+                                let external_payload_source = listener.external_payload.map(
+                                    |external_payload| {
+                                        let value = listener.value.clone();
+                                        Box::new(move |window: &mut Window, cx: &mut App| {
+                                            external_payload(value.as_ref(), window, cx)
+                                        })
+                                            as ExternalDragPayloadSource
+                                    },
+                                );
+                                cx.active_drag = Some(AnyDrag {
+                                    view: drag,
+                                    value: listener.value,
+                                    cursor_offset,
+                                    cursor_style: drag_cursor_style,
+                                    external_payload_source,
+                                });
+                                pending_touch_down.borrow_mut().remove(&event.id);
+                                window.active_touch_drag = Some(event.id);
+                                window.refresh();
+                                cx.stop_propagation();
+                            }
+                            TouchPhase::Ended | TouchPhase::Cancelled => {
+                                pending_touch_down.borrow_mut().remove(&event.id);
+                            }
+                            _ => {}
+                        }
+                    });
+                }
             }
 
             if let Some(hover_listener) = self.hover_listener.take() {
@@ -3334,10 +3523,10 @@ impl Interactivity {
             let allow_concurrent_scroll = style.allow_concurrent_scroll;
             let restrict_scroll_to_axis = style.restrict_scroll_to_axis;
             let line_height = window.line_height();
-            let hitbox = hitbox.clone();
+            let scroll_hitbox = hitbox.clone();
             let current_view = window.current_view();
             window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
-                if phase == DispatchPhase::Bubble && hitbox.should_handle_scroll(window) {
+                if phase == DispatchPhase::Bubble && scroll_hitbox.should_handle_scroll(window) {
                     let mut scroll_offset = scroll_offset.borrow_mut();
                     let old_scroll_offset = *scroll_offset;
                     let mut delta = event.delta.pixel_delta(line_height);
@@ -3620,6 +3809,7 @@ pub struct InteractiveElementState {
     /// press (mirroring the browser clearing a control's pressed state on
     /// blur). `None` means no activation key is pending.
     pub(crate) pending_keyboard_down: Option<Rc<RefCell<Option<u64>>>>,
+    pub(crate) pending_touch_down: Option<Rc<RefCell<HashMap<TouchId, TouchEvent>>>>,
     pub(crate) scroll_offset: Option<Rc<RefCell<Point<Pixels>>>>,
     ongoing_scroll: Option<Rc<RefCell<OngoingScroll>>>,
     pub(crate) active_tooltip: Option<Rc<RefCell<Option<ActiveTooltip>>>>,
