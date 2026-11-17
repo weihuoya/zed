@@ -726,11 +726,16 @@ impl TouchGestureRecognizer {
                 }
                 TouchGestureState::Caught(touch) if touch.id == event.id => {
                     let accumulated = event.position - touch.start_position;
-                    if accumulated == Point::default() {
+                    // Wait out the touch slop before picking the axis. A finger
+                    // that lands on a fling often jitters a pixel sideways
+                    // first; locking to that axis makes a vertical list ignore
+                    // the vertical drag that follows.
+                    if accumulated.magnitude() <= f64::from(self.tuning.touch_slop) {
                         self.state = TouchGestureState::Caught(touch);
                     } else {
-                        // The first movement picks the axis; from here on this
-                        // is an ordinary pan, so let the pan arm emit it.
+                        // The first movement past the slop picks the axis; from
+                        // here on this is an ordinary pan, so let the pan arm
+                        // emit it (carrying the whole distance travelled).
                         let axis = dominant_axis(accumulated);
                         self.state = TouchGestureState::Panning { touch, axis };
                         return self.handle_event_at(event, now);

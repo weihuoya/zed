@@ -1434,6 +1434,12 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
         Decorations::Server
     }
     fn set_app_id(&mut self, _app_id: &str) {}
+
+    /// Set the layer-shell surface margin (top, right, bottom, left).
+    /// Only meaningful on Wayland layer-shell windows.
+    #[cfg(all(target_os = "linux", feature = "wayland"))]
+    fn set_layer_shell_margin(&self, _margin: (Pixels, Pixels, Pixels, Pixels)) {}
+
     fn map_window(&mut self) -> anyhow::Result<()> {
         Ok(())
     }
@@ -2715,6 +2721,10 @@ pub struct WindowOptions {
     /// Window minimum size
     pub window_min_size: Option<Size<Pixels>>,
 
+    /// Additional application-controlled UI scaling, independent of the display scale.
+    /// Currently supported on Wayland.
+    pub ui_scale: f32,
+
     /// Whether to use client or server-side decorations on X11 and Wayland.
     /// The platform may ignore requests it cannot satisfy.
     pub window_decorations: Option<WindowDecorations>,
@@ -2790,6 +2800,8 @@ pub struct WindowParams {
 
     pub window_min_size: Option<Size<Pixels>>,
 
+    pub ui_scale: f32,
+
     #[cfg(target_os = "macos")]
     pub tabbing_identifier: Option<String>,
 
@@ -2857,6 +2869,7 @@ impl Default for WindowOptions {
             icon: None,
             app_id: None,
             window_min_size: None,
+            ui_scale: 1.0,
             window_decorations: None,
             tabbing_identifier: None,
             use_display_p3: false,

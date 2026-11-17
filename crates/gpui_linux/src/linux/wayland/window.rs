@@ -36,11 +36,11 @@ use crate::linux::wayland::{display::WaylandDisplay, serial::SerialKind};
 use crate::linux::{Globals, Output, PendingActivation, WaylandClientStatePtr, get_window};
 use gpui::{
     AnyWindowHandle, Bounds, Capslock, Corners, Decorations, DevicePixels, ExternalDragPayload,
-    FrameRequestSource, GpuSpecs, Modifiers, Pixels, PlatformAtlas, PlatformDisplay,
+    FileDropEvent, FrameRequestSource, GpuSpecs, Modifiers, Pixels, PlatformAtlas, PlatformDisplay,
     PlatformFrameSignal, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PromptButton,
-    PromptLevel, RequestFrameOptions, ResizeEdge, Scene, Size, Tiling, WindowAppearance,
-    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowControls, WindowDecorations,
-    WindowKind, WindowParams, WindowVisibility,
+    PromptLevel, RequestFrameOptions, ResizeEdge, Scene, ScrollDelta, Size, Tiling,
+    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowControls,
+    WindowDecorations, WindowKind, WindowParams, WindowVisibility,
     layer_shell::{Anchor, LayerShellNotSupportedError},
     popup::PopupOptions,
     px, size,
@@ -120,6 +120,7 @@ pub struct WaylandWindowState {
     renderer: Option<WgpuRenderer>,
     bounds: Bounds<Pixels>,
     scale: f32,
+    ui_scale: f32,
     input_handler: Option<PlatformInputHandler>,
     decorations: WindowDecorations,
     background_appearance: WindowBackgroundAppearance,
@@ -622,6 +623,7 @@ impl WaylandWindowState {
             renderer: Some(renderer),
             bounds: options.bounds,
             scale: 1.0,
+            ui_scale: options.ui_scale,
             input_handler: None,
             decorations: WindowDecorations::Client,
             background_appearance: WindowBackgroundAppearance::Opaque,
@@ -1525,11 +1527,12 @@ impl WaylandWindowStatePtr {
             bounds = input_handler.ime_candidate_bounds();
             self.state.borrow_mut().input_handler = Some(input_handler);
         }
-        bounds
+        let ui_scale = self.state.borrow().ui_scale;
+        bounds.map(|bounds| bounds.map(|value| value * ui_scale))
     }
 
     pub fn set_size_and_scale(&self, size: Option<Size<Pixels>>, scale: Option<f32>) {
-        let (size, scale) = {
+        let (size, scale, ui_scale) = {
             let mut state = self.state.borrow_mut();
             if size.is_none_or(|size| size == state.bounds.size)
                 && scale.is_none_or(|scale| scale == state.scale)
@@ -1546,12 +1549,12 @@ impl WaylandWindowStatePtr {
             if let Some(renderer) = &mut state.renderer {
                 renderer.update_drawable_size(device_bounds.size);
             }
-            (state.bounds.size, state.scale)
+            (state.bounds.size, state.scale, state.ui_scale)
         };
 
         let callback = self.callbacks.borrow_mut().resize.take();
         if let Some(mut fun) = callback {
-            fun(size, scale);
+            fun(size / ui_scale, scale * ui_scale);
             self.callbacks.borrow_mut().resize = Some(fun);
         }
 
@@ -1607,9 +1610,13 @@ impl WaylandWindowStatePtr {
         }
     }
 
-    pub fn handle_input(&self, input: PlatformInput) {
+    pub fn handle_input(&self, mut input: PlatformInput) {
         if self.is_blocked() {
             return;
+        }
+        let ui_scale = self.state.borrow().ui_scale;
+        if ui_scale != 1.0 {
+            scale_input(&mut input, ui_scale);
         }
         let callback = self.callbacks.borrow_mut().input.take();
         if let Some(mut fun) = callback {
@@ -1706,6 +1713,77 @@ impl WaylandWindowStatePtr {
     }
 }
 
+fn scale_input(input: &mut PlatformInput, ui_scale: f32) {
+    match input {
+        PlatformInput::MouseDown(event) => event.position = event.position / ui_scale,
+        PlatformInput::MouseUp(event) => event.position = event.position / ui_scale,
+        PlatformInput::MouseMove(event) => event.position = event.position / ui_scale,
+        PlatformInput::MouseExited(event) => event.position = event.position / ui_scale,
+        PlatformInput::Scroll(event) => {
+            event.position = event.position / ui_scale;
+            if let ScrollDelta::Pixels(delta) = &mut event.delta {
+                *delta = *delta / ui_scale;
+            }
+        }
+        PlatformInput::Pinch(event) => event.position = event.position / ui_scale,
+        PlatformInput::Touch(event) => {
+            event.position = event.position / ui_scale;
+            if let Some(position) = &mut event.predicted_position {
+                *position = *position / ui_scale;
+            }
+        }
+        PlatformInput::FileDrop(
+            FileDropEvent::Entered { position, .. }
+            | FileDropEvent::Pending { position }
+            | FileDropEvent::Submit { position },
+        ) => *position = *position / ui_scale,
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod ui_scale_tests {
+    use super::scale_input;
+    use gpui::{PlatformInput, ScrollDelta, ScrollEvent, TouchEvent, point, px};
+
+    #[test]
+    fn converts_touch_positions_to_ui_coordinates() {
+        let mut input = PlatformInput::Touch(TouchEvent {
+            position: point(px(200.0), px(100.0)),
+            predicted_position: Some(point(px(220.0), px(120.0))),
+            ..Default::default()
+        });
+
+        scale_input(&mut input, 2.0);
+
+        let PlatformInput::Touch(event) = input else {
+            unreachable!()
+        };
+        assert_eq!(event.position, point(px(100.0), px(50.0)));
+        assert_eq!(event.predicted_position, Some(point(px(110.0), px(60.0))));
+    }
+
+    #[test]
+    fn converts_pixel_scroll_deltas_to_ui_coordinates() {
+        let mut input = PlatformInput::Scroll(ScrollEvent {
+            position: point(px(200.0), px(100.0)),
+            delta: ScrollDelta::Pixels(point(px(40.0), px(-20.0))),
+            ..Default::default()
+        });
+
+        scale_input(&mut input, 2.0);
+
+        let PlatformInput::Scroll(event) = input else {
+            unreachable!()
+        };
+        assert_eq!(event.position, point(px(100.0), px(50.0)));
+        let ScrollDelta::Pixels(delta) = event.delta else {
+            unreachable!()
+        };
+        assert_eq!(delta, point(px(20.0), px(-10.0)));
+    }
+}
+
 fn extract_states<'a, S: TryFrom<u32> + 'a>(states: &'a [u8]) -> impl Iterator<Item = S> + 'a
 where
     <S as TryFrom<u32>>::Error: 'a,
@@ -1746,7 +1824,8 @@ impl rwh::HasDisplayHandle for WaylandWindow {
 
 impl PlatformWindow for WaylandWindow {
     fn bounds(&self) -> Bounds<Pixels> {
-        self.borrow().bounds
+        let state = self.borrow();
+        state.bounds / state.ui_scale
     }
 
     fn is_maximized(&self) -> bool {
@@ -1756,9 +1835,9 @@ impl PlatformWindow for WaylandWindow {
     fn window_bounds(&self) -> WindowBounds {
         let state = self.borrow();
         if state.fullscreen {
-            WindowBounds::Fullscreen(state.window_bounds)
+            WindowBounds::Fullscreen(state.window_bounds / state.ui_scale)
         } else if state.maximized {
-            WindowBounds::Maximized(state.window_bounds)
+            WindowBounds::Maximized(state.window_bounds / state.ui_scale)
         } else {
             drop(state);
             WindowBounds::Windowed(self.bounds())
@@ -1768,22 +1847,24 @@ impl PlatformWindow for WaylandWindow {
     fn inner_window_bounds(&self) -> WindowBounds {
         let state = self.borrow();
         if state.fullscreen {
-            WindowBounds::Fullscreen(state.window_bounds)
+            WindowBounds::Fullscreen(state.window_bounds / state.ui_scale)
         } else if state.maximized {
-            WindowBounds::Maximized(state.window_bounds)
+            WindowBounds::Maximized(state.window_bounds / state.ui_scale)
         } else {
-            let inset = state.inset();
+            let inset = state.inset() / state.ui_scale;
             drop(state);
             WindowBounds::Windowed(self.bounds().inset(inset))
         }
     }
 
     fn content_size(&self) -> Size<Pixels> {
-        self.borrow().bounds.size
+        let state = self.borrow();
+        state.bounds.size / state.ui_scale
     }
 
     fn resize(&mut self, size: Size<Pixels>) {
         let state = self.borrow();
+        let size = size.map(|dimension| dimension * state.ui_scale);
         let state_ptr = self.0.clone();
 
         // A popup's placement is the compositor's, so a resize re-runs the positioner and the
@@ -1832,7 +1913,8 @@ impl PlatformWindow for WaylandWindow {
     }
 
     fn scale_factor(&self) -> f32 {
-        self.borrow().scale
+        let state = self.borrow();
+        state.scale * state.ui_scale
     }
 
     fn appearance(&self) -> WindowAppearance {
@@ -1850,18 +1932,20 @@ impl PlatformWindow for WaylandWindow {
         Some(Rc::new(WaylandDisplay {
             id,
             name: display.name.clone(),
-            bounds: display.bounds.to_pixels(state.scale),
+            bounds: display.bounds.to_pixels(state.scale * state.ui_scale),
             refresh_interval: display.refresh_interval,
         }))
     }
 
     fn mouse_position(&self) -> Point<Pixels> {
-        self.borrow()
+        let state = self.borrow();
+        let position = state
             .client
             .get_client()
             .borrow()
             .mouse_location
-            .unwrap_or_default()
+            .unwrap_or_default();
+        position / state.ui_scale
     }
 
     fn modifiers(&self) -> Modifiers {
@@ -1938,6 +2022,20 @@ impl PlatformWindow for WaylandWindow {
             toplevel.set_app_id(app_id.to_owned());
         }
         state.app_id = Some(app_id.to_owned());
+    }
+
+    #[cfg(feature = "wayland")]
+    fn set_layer_shell_margin(&self, margin: (Pixels, Pixels, Pixels, Pixels)) {
+        let state = self.borrow();
+        if let Some(layer_surface) = state.surface_state.layer_surface() {
+            layer_surface.set_margin(
+                f32::from(margin.0) as i32,
+                f32::from(margin.1) as i32,
+                f32::from(margin.2) as i32,
+                f32::from(margin.3) as i32,
+            );
+            state.surface.commit();
+        }
     }
 
     fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance) {
@@ -2239,6 +2337,7 @@ impl PlatformWindow for WaylandWindow {
 
     fn set_client_inset(&self, inset: Pixels) {
         let mut state = self.borrow_mut();
+        let inset = inset * state.ui_scale;
         if Some(inset) != state.client_inset {
             state.client_inset = Some(inset);
             update_window(state);
@@ -2248,6 +2347,7 @@ impl PlatformWindow for WaylandWindow {
 
     fn set_client_corner_radii(&self, radii: Corners<Pixels>) {
         let mut state = self.borrow_mut();
+        let radii = radii.map(|radius| *radius * state.ui_scale);
         if radii != state.client_corner_radii {
             state.client_corner_radii = radii;
             update_window(state);
@@ -2260,7 +2360,9 @@ impl PlatformWindow for WaylandWindow {
         if !state.active {
             return;
         }
-        state.client.update_ime_position(bounds);
+        state
+            .client
+            .update_ime_position(bounds.map(|value| value * state.ui_scale));
     }
 
     fn gpu_specs(&self) -> Option<GpuSpecs> {
